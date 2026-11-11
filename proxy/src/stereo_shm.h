@@ -16,7 +16,9 @@ struct StereoShm
 	volatile LONG flatMode;  // proxy: 1 while no camera updates (menus, intro, loading) -> 2D screen
 	volatile LONG poseSeq;   // proxy: seqlock for the pose below (odd while writing)
 	volatile LONG poseValid; // proxy: 1 when the HMD pose is tracked
-	volatile LONG pad;
+	volatile LONG zoom;      // proxy: 0 normal, 1 aiming (narrowed FOV), 2 very narrow (Pip-Boy) -> 2D screen
+	volatile LONG camState;  // plugin: active camera state index (0 = first person; VATS = 2, 3rd person = 8, ...)
+	volatile LONG pad2;
 	float hmdPos[3];         // HMD position, OpenVR seated space, metres (x right, y up, -z forward)
 	float hmdQuat[4];        // HMD rotation, OpenVR seated space, quaternion (w, x, y, z)
 };

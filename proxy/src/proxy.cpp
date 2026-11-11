@@ -22,6 +22,7 @@
 #include <vector>
 #include "stereo_shm.h"
 #include "openvr.h"
+#include <shlobj.h>
 
 typedef HRESULT(STDMETHODCALLTYPE* PresentFn)(IDXGISwapChain*, UINT, UINT);
 typedef void(STDMETHODCALLTYPE* VSSetCBFn)(ID3D11DeviceContext*, UINT, UINT, ID3D11Buffer* const*);
@@ -176,6 +177,8 @@ static UINT g_fpMiss752 = 0;
 static float g_lastD[3] = { 0.0f, 0.0f, 0.0f };
 static float g_projK = 1.0f;
 static float g_projNear = -15.0f;
+static volatile float g_gameTanX = 0.0f;  // game tan(half horizontal FOV)
+static volatile float g_gameTanY = 0.0f;  // game tan(half vertical FOV)
 static UINT g_scanClip = 0;
 // Unpatched camera matrices of the current frame (copied from the 752-byte buffer
 // before patching) so copies in other buffers can be found and patched the same way.
@@ -264,6 +267,11 @@ static void PatchCameraBuffer(void* ptr, UINT bytes) {
     // Only the world camera: loading-screen / UI cameras sit at the origin.
     if (fabsf(row(35)[0]) < 100.0f && fabsf(row(35)[1]) < 100.0f) return;
     g_projK = row(6)[2];
+    // rows 4/5 x/y = 1/tan(half FOV) of the game projection (measured 1.1698 / 2.1187 at 2052x1133)
+    if (row(4)[0] > 0.05f && row(5)[1] > 0.05f) {
+        g_gameTanX = 1.0f / row(4)[0];
+        g_gameTanY = 1.0f / row(5)[1];
+    }
     g_projNear = row(6)[3];
 
     if (!g_stereoEnabled || g_ampUnits == 0.0f) return;
@@ -628,7 +636,8 @@ static void DumpCandidates() {
 // writes the eye into shared memory. Here every presented frame is copied into
 // that eye's texture and both eye textures are submitted to the SteamVR compositor.
 // openvr_api.dll is loaded dynamically from SteamVR; no import library is needed.
-// Config [vr]: enabled, eye_delay (0/1), swap_eyes (0/1), wait_poses (0/1).
+// Config [vr]: enabled, eye_delay (0/1), swap_eyes (0/1), wait_poses (0/1),
+// flat_after_frames, screen_width_m, screen_distance_m. Menus/loading go to a 2D overlay screen.
 typedef uint32_t(__cdecl* VRInitFn)(vr::EVRInitError*, vr::EVRApplicationType, const char*);
 typedef void*(__cdecl* VRGetIfaceFn)(const char*, vr::EVRInitError*);
 typedef bool(__cdecl* VRIsHmdFn)();
@@ -637,15 +646,37 @@ static bool g_vrEnabled = false;
 static int g_vrEyeDelay = 0;
 static bool g_vrSwap = false;
 static bool g_vrWaitPoses = true;
+static int g_vrFlatAfter = 20;          // presents without camera updates -> 2D screen mode
+static float g_vrOverlayWidth = 3.0f;   // metres
+static float g_vrOverlayDist = 2.0f;    // metres in front of the seated origin
 static bool g_vrTried = false;
 static vr::IVRCompositor* g_vrComp = nullptr;
+static vr::IVROverlay* g_vrOverlay = nullptr;
+static vr::VROverlayHandle_t g_overlay = vr::k_ulOverlayHandleInvalid;
+static bool g_overlayShown = false;
 static ID3D11Texture2D* g_eyeTex[2] = { nullptr, nullptr };
+static ID3D11Texture2D* g_flatTex = nullptr;
+static ID3D11Texture2D* g_blackTex = nullptr;
 static UINT g_eyeW = 0, g_eyeH = 0;
 static DXGI_FORMAT g_eyeFmt = DXGI_FORMAT_UNKNOWN;
 static StereoShm* g_shm = nullptr;
-static LONG g_vrPrevEye = 0;
 static UINT g_vrSubmits = 0, g_vrSubmitErr = 0, g_vrSubmitOk = 0;
 static int g_vrLastErr = 0;
+static LONG g_lastSeq = -1;
+static int g_seqStill = 0;
+static int g_flatPrev = -1;
+static UINT g_poseWrites = 0;
+static bool g_vrUseBounds = true;   // [vr] fov_bounds
+static bool g_vrNoVsync = true;     // [vr] no_vsync
+static bool g_vrAutoConfigure = true;  // [vr] auto_configure
+static float g_coverH = 0.0f;          // headset cover tan(half horizontal FOV)
+static float g_vrAimRatio = 0.95f;     // [vr] aim_ratio: game FOV narrower than this x headset -> aiming (mono)
+static float g_vrPipboyRatio = 0.5f;   // [vr] pipboy_ratio: narrower than this -> Pip-Boy (2D screen)
+static bool g_vrPipboy2D = true;       // [vr] pipboy_2d
+static bool g_vrOtherCams2D = true;    // [vr] other_cams_2d: VATS, dialogue, 3rd person... on the 2D screen
+static LONG g_zoomPrev = -1, g_camStatePrev = -1;
+static unsigned g_vrCamMask = (1u << 0) | (1u << 7);  // [vr] vr_cam_states: states shown in VR (0 first person, 7 third person)
+static int g_boundsLogged = 0;
 
 static void LoadVrConfig() {
     char dir[MAX_PATH];
@@ -662,17 +693,206 @@ static void LoadVrConfig() {
     g_vrSwap = atoi(buf) != 0;
     GetPrivateProfileStringA("vr", "wait_poses", "1", buf, sizeof(buf), ini.c_str());
     g_vrWaitPoses = atoi(buf) != 0;
-    Log("vr config: enabled=%d eye_delay=%d swap_eyes=%d wait_poses=%d",
-        g_vrEnabled ? 1 : 0, g_vrEyeDelay, g_vrSwap ? 1 : 0, g_vrWaitPoses ? 1 : 0);
+    GetPrivateProfileStringA("vr", "flat_after_frames", "20", buf, sizeof(buf), ini.c_str());
+    g_vrFlatAfter = atoi(buf);
+    GetPrivateProfileStringA("vr", "screen_width_m", "3.0", buf, sizeof(buf), ini.c_str());
+    g_vrOverlayWidth = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "screen_distance_m", "2.0", buf, sizeof(buf), ini.c_str());
+    g_vrOverlayDist = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "fov_bounds", "1", buf, sizeof(buf), ini.c_str());
+    g_vrUseBounds = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "no_vsync", "1", buf, sizeof(buf), ini.c_str());
+    g_vrNoVsync = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "auto_configure", "1", buf, sizeof(buf), ini.c_str());
+    g_vrAutoConfigure = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "aim_ratio", "0.95", buf, sizeof(buf), ini.c_str());
+    g_vrAimRatio = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "pipboy_ratio", "0.5", buf, sizeof(buf), ini.c_str());
+    g_vrPipboyRatio = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "pipboy_2d", "1", buf, sizeof(buf), ini.c_str());
+    g_vrPipboy2D = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "other_cams_2d", "1", buf, sizeof(buf), ini.c_str());
+    g_vrOtherCams2D = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "vr_cam_states", "0,7", buf, sizeof(buf), ini.c_str());
+    g_vrCamMask = 0;
+    for (char* p = buf; *p;) {
+        const long v = strtol(p, &p, 10);
+        if (v >= 0 && v < 32) g_vrCamMask |= 1u << v;
+        while (*p == ',' || *p == ' ') ++p;
+        if (*p && (*p < '0' || *p > '9')) break;
+    }
+    Log("vr config: enabled=%d eye_delay=%d swap_eyes=%d wait_poses=%d flat_after=%d screen=%.2fm@%.2fm",
+        g_vrEnabled ? 1 : 0, g_vrEyeDelay, g_vrSwap ? 1 : 0, g_vrWaitPoses ? 1 : 0, g_vrFlatAfter,
+        g_vrOverlayWidth, g_vrOverlayDist);
 }
 
+static void VrPlaceOverlay() {
+    if (!g_vrOverlay || g_overlay == vr::k_ulOverlayHandleInvalid) return;
+    vr::HmdMatrix34_t m = {};
+    m.m[0][0] = 1.0f; m.m[1][1] = 1.0f; m.m[2][2] = 1.0f;
+    m.m[2][3] = -g_vrOverlayDist;  // seated space: -z is forward from the seated zero pose
+    g_vrOverlay->SetOverlayTransformAbsolute(g_overlay, vr::TrackingUniverseSeated, &m);
+    g_vrOverlay->SetOverlayWidthInMeters(g_overlay, g_vrOverlayWidth);
+}
+
+
+
+// --- Automatic game settings for the connected headset ([vr] auto_configure=1) ---
+// From the measured per-eye view: window = headset aspect, height limited to what fits
+// on the desktop (a window cannot be taller than the work area), FOV set so the game's
+// horizontal FOV covers the headset. Fallout 4 defines FOV horizontally at 16:9 and
+// scales Hor+ (measured: 80 -> 81.06 deg at aspect 1.811), so
+//   fov = 2 * atan(tan(hfov / 2) * (16/9) / aspect).
+// Writes Fallout4Prefs.ini [Display] iSize W/H and Fallout4Custom.ini [Display]
+// fDefaultWorldFOV/fDefault1stPersonFOV, only when values change. Takes effect on the
+// next game start. Read-only attributes are kept; a one-time backup *.bak_fo4stereo is made.
+
+static std::string DocumentsFallout4Dir() {
+    PWSTR docs = nullptr;
+    std::string out;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs)) && docs) {
+        char buf[MAX_PATH * 2] = {};
+        WideCharToMultiByte(CP_ACP, 0, docs, -1, buf, sizeof(buf), nullptr, nullptr);
+        out = std::string(buf) + "\\My Games\\Fallout4\\";
+    }
+    if (docs) CoTaskMemFree(docs);
+    return out;
+}
+
+static bool IniSetIfDifferent(const std::string& file, const char* section, const char* key, const char* value) {
+    char cur[64] = {};
+    GetPrivateProfileStringA(section, key, "", cur, sizeof(cur), file.c_str());
+    if (strcmp(cur, value) == 0) return false;
+
+    const std::string bak = file + ".bak_fo4stereo";
+    if (GetFileAttributesA(bak.c_str()) == INVALID_FILE_ATTRIBUTES) CopyFileA(file.c_str(), bak.c_str(), TRUE);
+    const DWORD attrs = GetFileAttributesA(file.c_str());
+    const bool readOnly = attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY);
+    if (readOnly) SetFileAttributesA(file.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+    const BOOL ok = WritePrivateProfileStringA(section, key, value, file.c_str());
+    if (readOnly) SetFileAttributesA(file.c_str(), attrs);
+    Log("vr: auto-config %s [%s] %s: '%s' -> '%s' (%s)", file.c_str(), section, key, cur, value, ok ? "ok" : "FAILED");
+    return ok != 0;
+}
+
+static void VrAutoConfigure(float h, float v, uint32_t recH) {
+    if (!g_vrAutoConfigure || h <= 0.0f || v <= 0.0f) return;
+    const std::string dir = DocumentsFallout4Dir();
+    if (dir.empty()) { Log("vr: auto-config: Documents folder not found"); return; }
+
+    // Tallest client area a normal window can have on the primary work area.
+    RECT wa = {};
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+    RECT frame = { 0, 0, 100, 100 };
+    AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+    const int frameH = (frame.bottom - frame.top) - 100;
+    int maxH = (wa.bottom - wa.top) - frameH;
+    if (maxH < 480) maxH = 480;
+
+    const float aspect = h / v;
+    UINT H = recH > 0 ? recH : 1080;
+    if (H > static_cast<UINT>(maxH)) H = static_cast<UINT>(maxH);
+    const UINT W = static_cast<UINT>(H * aspect + 0.5f);
+    const float fov = 2.0f * atanf(h * (16.0f / 9.0f) / aspect) * 57.2957795f;
+
+    char sw[32], sh[32], sf[32];
+    sprintf_s(sw, "%u", W);
+    sprintf_s(sh, "%u", H);
+    sprintf_s(sf, "%.1f", fov);
+    const std::string prefs = dir + "Fallout4Prefs.ini";
+    const std::string custom = dir + "Fallout4Custom.ini";
+    bool changed = false;
+    changed |= IniSetIfDifferent(prefs, "Display", "iSize W", sw);
+    changed |= IniSetIfDifferent(prefs, "Display", "iSize H", sh);
+    changed |= IniSetIfDifferent(custom, "Display", "fDefaultWorldFOV", sf);
+    changed |= IniSetIfDifferent(custom, "Display", "fDefault1stPersonFOV", sf);
+    Log("vr: auto-config target window %ux%u (max client height %d) fov %s -> %s", W, H, maxH, sf,
+        changed ? "UPDATED, restart the game to apply" : "already set");
+}
+
+// HMD view per eye: raw projection tangents (left/right/top/bottom, left/top negative)
+// and the recommended render size. Writes a recommendation for the game's window size
+// and FOV to fo4stereo_hmd.txt next to the game.
+static float g_eyeTan[2][4] = {};  // l, r, t, b
+static bool g_haveEyeTan = false;
+
+static void VrQueryHmdView(VRGetIfaceFn getIface) {
+    vr::EVRInitError err = vr::VRInitError_None;
+    auto* sys = static_cast<vr::IVRSystem*>(getIface(vr::IVRSystem_Version, &err));
+    if (!sys || err != vr::VRInitError_None) { Log("vr: IVRSystem unavailable err=%d", (int)err); return; }
+    uint32_t rw = 0, rh = 0;
+    sys->GetRecommendedRenderTargetSize(&rw, &rh);
+    for (int e = 0; e < 2; ++e) {
+        sys->GetProjectionRaw(e == 0 ? vr::Eye_Left : vr::Eye_Right,
+                              &g_eyeTan[e][0], &g_eyeTan[e][1], &g_eyeTan[e][2], &g_eyeTan[e][3]);
+    }
+    g_haveEyeTan = true;
+    float h = 0.0f, v = 0.0f;
+    for (int e = 0; e < 2; ++e) {
+        h = (std::max)(h, (std::max)(fabsf(g_eyeTan[e][0]), fabsf(g_eyeTan[e][1])));
+        v = (std::max)(v, (std::max)(fabsf(g_eyeTan[e][2]), fabsf(g_eyeTan[e][3])));
+    }
+    g_coverH = h;
+    const float rad2deg = 57.2957795f;
+    const float hfov = 2.0f * atanf(h) * rad2deg;
+    const float vfov = 2.0f * atanf(v) * rad2deg;
+    const UINT winH = rh;
+    const UINT winW = static_cast<UINT>(rh * (h / v) + 0.5f);
+    Log("vr: hmd per-eye recommended %ux%u", rw, rh);
+    for (int e = 0; e < 2; ++e) {
+        Log("vr: eye %d tan l=%.4f r=%.4f t=%.4f b=%.4f", e, g_eyeTan[e][0], g_eyeTan[e][1], g_eyeTan[e][2], g_eyeTan[e][3]);
+    }
+    Log("vr: symmetric cover h=%.4f v=%.4f -> hfov=%.1f vfov=%.1f aspect=%.3f window=%ux%u", h, v, hfov, vfov, h / v, winW, winH);
+
+    char dir[MAX_PATH];
+    GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    char* slash = strrchr(dir, '\\');
+    if (slash) *(slash + 1) = '\0';
+    std::string path = dir + std::string("fo4stereo_hmd.txt");
+    if (FILE* f = _fsopen(path.c_str(), "w", _SH_DENYNO)) {
+        fprintf(f, "; Written by fo4stereo d3d11.dll from SteamVR (per-eye view of the connected headset)\n");
+        fprintf(f, "recommended_per_eye=%ux%u\n", rw, rh);
+        for (int e = 0; e < 2; ++e) {
+            fprintf(f, "eye%d_tan_l_r_t_b=%.5f %.5f %.5f %.5f\n", e, g_eyeTan[e][0], g_eyeTan[e][1], g_eyeTan[e][2], g_eyeTan[e][3]);
+        }
+        fprintf(f, "cover_hfov_deg=%.2f\ncover_vfov_deg=%.2f\naspect=%.4f\n", hfov, vfov, h / v);
+        fprintf(f, "suggest_iSize_W=%u\nsuggest_iSize_H=%u\nsuggest_fDefaultWorldFOV=%.1f\n", winW, winH, hfov);
+        fclose(f);
+    }
+    VrAutoConfigure(h, v, rh);
+}
+
+// Texture bounds that map the game's symmetric projection onto this eye's view.
+// Uses the game's real FOV (from its camera buffer), so it stays correct for any game FOV;
+// regions outside the game image are clamped (stretched) until the game FOV covers the eye.
+static bool VrEyeBounds(int eye, vr::VRTextureBounds_t& b) {
+    const float gx = g_gameTanX, gy = g_gameTanY;
+    if (!g_haveEyeTan || gx <= 0.0f || gy <= 0.0f) return false;
+    auto clamp01 = [](float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); };
+    const float* t = g_eyeTan[eye];
+    b.uMin = clamp01((t[0] + gx) / (2.0f * gx));
+    b.uMax = clamp01((t[1] + gx) / (2.0f * gx));
+    b.vMin = clamp01((t[2] + gy) / (2.0f * gy));
+    b.vMax = clamp01((t[3] + gy) / (2.0f * gy));
+    return b.uMax > b.uMin && b.vMax > b.vMin;
+}
+
+static UINT g_vrInitAttempts = 0;
+static ULONGLONG g_vrNextTryMs = 0;
+
+// Retries every 10 s until SteamVR has a headset, so the HMD can be connected after the game started.
 static void VrInitOnce() {
-    if (g_vrTried) return;
-    g_vrTried = true;
-    LoadVrConfig();
-    g_shm = OpenStereoShm();
-    Log("stereo shm %s", g_shm ? "open" : "FAILED");
-    if (!g_vrEnabled) return;
+    if (!g_vrTried) {
+        g_vrTried = true;
+        LoadVrConfig();
+        g_shm = OpenStereoShm();
+        Log("stereo shm %s", g_shm ? "open" : "FAILED");
+    }
+    if (!g_vrEnabled || g_vrComp) return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_vrNextTryMs) return;
+    g_vrNextTryMs = now + 10000;
+    if (g_vrInitAttempts++ > 0) Log("vr: init retry #%u", g_vrInitAttempts);
 
     HMODULE vrdll = LoadLibraryA("openvr_api.dll");
     if (!vrdll) vrdll = LoadLibraryA("C:\\Steam\\steamapps\\common\\SteamVR\\bin\\win64\\openvr_api.dll");
@@ -684,14 +904,43 @@ static void VrInitOnce() {
     Log("vr: hmd present=%d", isHmd ? (isHmd() ? 1 : 0) : -1);
     vr::EVRInitError err = vr::VRInitError_None;
     init(&err, vr::VRApplication_Scene, nullptr);
-    if (err != vr::VRInitError_None) { Log("vr: init failed err=%d", (int)err); return; }
+    if (err != vr::VRInitError_None) {
+        Log("vr: init failed err=%d (108 = headset not found; retrying in 10 s)", (int)err);
+        typedef void(__cdecl* VRShutdownFn)();
+        if (auto shut = reinterpret_cast<VRShutdownFn>(GetProcAddress(vrdll, "VR_ShutdownInternal"))) shut();
+        return;
+    }
     g_vrComp = static_cast<vr::IVRCompositor*>(getIface(vr::IVRCompositor_Version, &err));
     if (!g_vrComp || err != vr::VRInitError_None) {
         Log("vr: compositor %s failed err=%d", vr::IVRCompositor_Version, (int)err);
         g_vrComp = nullptr;
         return;
     }
-    Log("vr: compositor ready (%s)", vr::IVRCompositor_Version);
+    g_vrComp->SetTrackingSpace(vr::TrackingUniverseSeated);
+    Log("vr: compositor ready (%s), seated tracking", vr::IVRCompositor_Version);
+    VrQueryHmdView(getIface);
+
+    g_vrOverlay = static_cast<vr::IVROverlay*>(getIface(vr::IVROverlay_Version, &err));
+    if (g_vrOverlay && err == vr::VRInitError_None) {
+        vr::EVROverlayError oe = g_vrOverlay->CreateOverlay("fo4stereo.screen", "Fallout 4", &g_overlay);
+        if (oe != vr::VROverlayError_None) {
+            Log("vr: CreateOverlay failed %d", (int)oe);
+            g_overlay = vr::k_ulOverlayHandleInvalid;
+        } else {
+            VrPlaceOverlay();
+            Log("vr: 2D screen overlay ready (%s)", vr::IVROverlay_Version);
+        }
+    } else {
+        Log("vr: overlay interface %s unavailable err=%d", vr::IVROverlay_Version, (int)err);
+        g_vrOverlay = nullptr;
+    }
+}
+
+static bool CreateFrameTexture(const D3D11_TEXTURE2D_DESC& e, const void* init, UINT pitch, ID3D11Texture2D** out) {
+    D3D11_SUBRESOURCE_DATA sd = {};
+    sd.pSysMem = init;
+    sd.SysMemPitch = pitch;
+    return SUCCEEDED(g_dev->CreateTexture2D(&e, init ? &sd : nullptr, out));
 }
 
 static void VrEnsureTextures(ID3D11Texture2D* bb) {
@@ -699,6 +948,8 @@ static void VrEnsureTextures(ID3D11Texture2D* bb) {
     bb->GetDesc(&d);
     if (g_eyeTex[0] && d.Width == g_eyeW && d.Height == g_eyeH && d.Format == g_eyeFmt) return;
     for (auto& t : g_eyeTex) { if (t) { t->Release(); t = nullptr; } }
+    if (g_flatTex) { g_flatTex->Release(); g_flatTex = nullptr; }
+    if (g_blackTex) { g_blackTex->Release(); g_blackTex = nullptr; }
     D3D11_TEXTURE2D_DESC e = d;
     e.MipLevels = 1;
     e.ArraySize = 1;
@@ -710,41 +961,153 @@ static void VrEnsureTextures(ID3D11Texture2D* bb) {
     // Shareable so the SteamVR compositor can open it (error 106 SharedTexturesNotSupported otherwise).
     e.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
     for (auto& t : g_eyeTex) {
-        if (FAILED(g_dev->CreateTexture2D(&e, nullptr, &t))) { Log("vr: eye texture create failed"); return; }
+        if (!CreateFrameTexture(e, nullptr, 0, &t)) { Log("vr: eye texture create failed"); return; }
     }
+    if (!CreateFrameTexture(e, nullptr, 0, &g_flatTex)) Log("vr: flat texture create failed");
+    // Black frame for both eyes while the 2D screen is shown (4 bytes per pixel formats).
+    std::vector<uint8_t> zeros(static_cast<size_t>(d.Width) * d.Height * 4, 0);
+    if (!CreateFrameTexture(e, zeros.data(), d.Width * 4, &g_blackTex)) Log("vr: black texture create failed");
     g_eyeW = d.Width; g_eyeH = d.Height; g_eyeFmt = d.Format;
     Log("vr: eye textures %ux%u fmt=%d samples=%u", d.Width, d.Height, (int)d.Format, d.SampleDesc.Count);
+}
+
+// HMD pose (seated space) -> shared memory, for the plugin's head tracking.
+static void VrWritePose(const vr::TrackedDevicePose_t& p) {
+    if (!g_shm) return;
+    const auto& m = p.mDeviceToAbsoluteTracking.m;
+    float q[4];
+    const float tr = m[0][0] + m[1][1] + m[2][2];
+    if (tr > 0.0f) {
+        const float s = sqrtf(tr + 1.0f) * 2.0f;
+        q[0] = 0.25f * s;
+        q[1] = (m[2][1] - m[1][2]) / s;
+        q[2] = (m[0][2] - m[2][0]) / s;
+        q[3] = (m[1][0] - m[0][1]) / s;
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        const float s = sqrtf(1.0f + m[0][0] - m[1][1] - m[2][2]) * 2.0f;
+        q[0] = (m[2][1] - m[1][2]) / s;
+        q[1] = 0.25f * s;
+        q[2] = (m[0][1] + m[1][0]) / s;
+        q[3] = (m[0][2] + m[2][0]) / s;
+    } else if (m[1][1] > m[2][2]) {
+        const float s = sqrtf(1.0f + m[1][1] - m[0][0] - m[2][2]) * 2.0f;
+        q[0] = (m[0][2] - m[2][0]) / s;
+        q[1] = (m[0][1] + m[1][0]) / s;
+        q[2] = 0.25f * s;
+        q[3] = (m[1][2] + m[2][1]) / s;
+    } else {
+        const float s = sqrtf(1.0f + m[2][2] - m[0][0] - m[1][1]) * 2.0f;
+        q[0] = (m[1][0] - m[0][1]) / s;
+        q[1] = (m[0][2] + m[2][0]) / s;
+        q[2] = (m[1][2] + m[2][1]) / s;
+        q[3] = 0.25f * s;
+    }
+    InterlockedIncrement(&g_shm->poseSeq);  // odd: writing
+    g_shm->hmdPos[0] = m[0][3];
+    g_shm->hmdPos[1] = m[1][3];
+    g_shm->hmdPos[2] = m[2][3];
+    for (int i = 0; i < 4; ++i) g_shm->hmdQuat[i] = q[i];
+    g_shm->poseValid = p.bPoseIsValid ? 1 : 0;
+    InterlockedIncrement(&g_shm->poseSeq);  // even: done
+    if (g_poseWrites++ < 3 || g_poseWrites % 600 == 0) {
+        Log("vr: hmd pose valid=%d pos=(%.3f %.3f %.3f) q=(%.3f %.3f %.3f %.3f)", p.bPoseIsValid ? 1 : 0,
+            m[0][3], m[1][3], m[2][3], q[0], q[1], q[2], q[3]);
+    }
 }
 
 // Called from Present before the original Present.
 static void VrOnPresent(IDXGISwapChain* sc) {
     VrInitOnce();
-    if (g_shm) InterlockedIncrement(&g_shm->presents);
+    // Frames presented before this one; the plugin picked this frame's eye from the same count.
+    const LONG count = g_shm ? InterlockedIncrement(&g_shm->presents) - 1 : static_cast<LONG>(g_vrSubmits);
     if (!g_vrComp || !g_dev || !g_ctx) return;
+
+    // SteamVR takes window focus when it starts; Fallout 4 pauses without focus
+    // (black headset until the window is clicked). Give the game window focus once.
+    static bool s_focused = false;
+    if (!s_focused) {
+        s_focused = true;
+        DXGI_SWAP_CHAIN_DESC sd = {};
+        if (SUCCEEDED(sc->GetDesc(&sd)) && sd.OutputWindow) {
+            const BOOL ok = SetForegroundWindow(sd.OutputWindow);
+            Log("vr: focus game window %p -> %d", (void*)sd.OutputWindow, ok ? 1 : 0);
+        }
+    }
+
+    // 2D screen while the engine camera is not updating (intro, main menu, loading).
+    const LONG seq = g_shm ? g_shm->seq : 0;
+    if (seq != g_lastSeq) { g_lastSeq = seq; g_seqStill = 0; }
+    else if (g_seqStill < 1000000) g_seqStill++;
+    // Zoom from the game projection: aiming narrows the FOV a little, the Pip-Boy a lot.
+    LONG zoom = 0;
+    if (g_coverH > 0.0f && g_gameTanX > 0.0f) {
+        const float r = g_gameTanX / g_coverH;
+        zoom = r < g_vrPipboyRatio ? 2 : (r < g_vrAimRatio ? 1 : 0);
+    }
+    const LONG camState = g_shm ? g_shm->camState : 0;
+    if (g_shm) InterlockedExchange(&g_shm->zoom, zoom);
+    if (zoom != g_zoomPrev || camState != g_camStatePrev) {
+        Log("vr: zoom=%ld (game tan x=%.3f, ratio %.3f) camState=%ld", zoom, g_gameTanX,
+            g_coverH > 0.0f ? g_gameTanX / g_coverH : 0.0f, camState);
+        g_zoomPrev = zoom; g_camStatePrev = camState;
+    }
+    const bool flat = !g_shm || g_seqStill >= g_vrFlatAfter || (zoom == 2 && g_vrPipboy2D)
+                      || (g_vrOtherCams2D && camState >= 0 && camState < 32 && !(g_vrCamMask & (1u << camState)));
+    if (g_shm) InterlockedExchange(&g_shm->flatMode, flat ? 1 : 0);
+    if (static_cast<int>(flat) != g_flatPrev) {
+        Log("vr: mode -> %s (frame %ld seq %ld)", flat ? "2D screen" : "3D stereo", count, seq);
+        g_flatPrev = flat ? 1 : 0;
+    }
 
     ID3D11Texture2D* bb = nullptr;
     if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb))) || !bb) return;
     VrEnsureTextures(bb);
     if (!g_eyeTex[0]) { bb->Release(); return; }
 
-    LONG eye = g_shm ? g_shm->eye : 0;
-    if (g_vrEyeDelay == 1) { LONG cur = eye; eye = g_vrPrevEye; g_vrPrevEye = cur; }
+    LONG eye = (count - g_vrEyeDelay) & 1;
     if (g_vrSwap) eye ^= 1;
-    eye &= 1;
 
+    ID3D11Texture2D* dst = flat ? g_flatTex : g_eyeTex[eye];
     D3D11_TEXTURE2D_DESC d = {};
     bb->GetDesc(&d);
-    if (d.SampleDesc.Count > 1) g_ctx->ResolveSubresource(g_eyeTex[eye], 0, bb, 0, d.Format);
-    else g_ctx->CopyResource(g_eyeTex[eye], bb);
+    if (dst) {
+        if (d.SampleDesc.Count > 1) g_ctx->ResolveSubresource(dst, 0, bb, 0, d.Format);
+        else g_ctx->CopyResource(dst, bb);
+    }
     bb->Release();
 
     if (g_vrWaitPoses) {
-        vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
+        vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount] = {};
         g_vrComp->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+        VrWritePose(poses[vr::k_unTrackedDeviceIndex_Hmd]);
     }
+
+    if (flat && g_vrOverlay && g_overlay != vr::k_ulOverlayHandleInvalid && g_flatTex) {
+        vr::Texture_t ftex = { g_flatTex, vr::TextureType_DirectX, vr::ColorSpace_Auto };
+        g_vrOverlay->SetOverlayTexture(g_overlay, &ftex);
+        if (!g_overlayShown) {
+            VrPlaceOverlay();
+            g_vrOverlay->ShowOverlay(g_overlay);
+            g_overlayShown = true;
+        }
+    } else if (!flat && g_overlayShown) {
+        g_vrOverlay->HideOverlay(g_overlay);
+        g_overlayShown = false;
+    }
+
     for (int i = 0; i < 2; ++i) {
-        vr::Texture_t tex = { g_eyeTex[i], vr::TextureType_DirectX, vr::ColorSpace_Auto };
-        vr::EVRCompositorError e = g_vrComp->Submit(i == 0 ? vr::Eye_Left : vr::Eye_Right, &tex);
+        ID3D11Texture2D* src = flat ? g_blackTex : g_eyeTex[i];
+        if (!src) continue;
+        vr::Texture_t tex = { src, vr::TextureType_DirectX, vr::ColorSpace_Auto };
+        vr::VRTextureBounds_t bounds = { 0.0f, 0.0f, 1.0f, 1.0f };
+        const bool useBounds = !flat && g_vrUseBounds && VrEyeBounds(i, bounds);
+        if (useBounds && g_boundsLogged < 2) {
+            g_boundsLogged++;
+            Log("vr: eye %d bounds u=%.3f..%.3f v=%.3f..%.3f (game tan x=%.3f y=%.3f)", i, bounds.uMin, bounds.uMax,
+                bounds.vMin, bounds.vMax, g_gameTanX, g_gameTanY);
+        }
+        vr::EVRCompositorError e = g_vrComp->Submit(i == 0 ? vr::Eye_Left : vr::Eye_Right, &tex,
+                                                    useBounds ? &bounds : nullptr);
         if (e != vr::VRCompositorError_None) {
             g_vrLastErr = (int)e;
             if (g_vrSubmitErr++ < 10) Log("vr: submit eye %d error %d", i, (int)e);
@@ -754,8 +1117,8 @@ static void VrOnPresent(IDXGISwapChain* sc) {
     }
     g_vrComp->PostPresentHandoff();
     if (g_vrSubmits++ < 3 || g_vrSubmits % 600 == 0) {
-        Log("vr: frame %u eye=%ld seq=%ld submitOk=%u submitErr=%u lastErr=%d", g_vrSubmits, eye,
-            g_shm ? g_shm->seq : -1, g_vrSubmitOk, g_vrSubmitErr, g_vrLastErr);
+        Log("vr: frame %u eye=%ld seq=%ld flat=%d submitOk=%u submitErr=%u lastErr=%d", g_vrSubmits, eye,
+            seq, flat ? 1 : 0, g_vrSubmitOk, g_vrSubmitErr, g_vrLastErr);
     }
 }
 
@@ -794,7 +1157,10 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* self, UINT sync, 
         DumpCandidates();
     }
     VrOnPresent(self);
-    return g_origPresent(self, sync, flags);
+    // The game presents with sync interval 2 (30 fps at 60 Hz). With VR running, the
+    // compositor's WaitGetPoses paces frames to the headset, so drop the game's vsync.
+    const UINT useSync = (g_vrComp && g_vrNoVsync) ? 0 : sync;
+    return g_origPresent(self, useSync, flags);
 }
 
 static void STDMETHODCALLTYPE HookedVSSetCB(ID3D11DeviceContext* self, UINT start, UINT num,

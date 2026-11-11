@@ -1,6 +1,6 @@
 # Ohjeistus AI-agentille: Fallout 4 flat -> VR
 
-Päivitetty: 2026-11-11 klo 22.15. Lue tämä ensin ja sitten `STATUS.md`, jossa on yksityiskohtainen historia.
+Päivitetty: 2026-11-11 klo 22.30. Lue tämä ensin ja sitten `STATUS.md`, jossa on yksityiskohtainen historia.
 
 ## Tavoite ja tilanne yhdellä silmäyksellä
 
@@ -10,9 +10,11 @@ Flat Fallout 4 (1.11.240, Next-Gen) pelattavaksi Quest 3:lla aidolla stereokuval
 |---|---|
 | Silmäsiirto moottorin kameraan (F4SE-plugin) | ✅ Toimii. Heiluntatesti vahvisti: lasi, varjot ja efektit seuraavat. |
 | Silmien vuorottelu ±IPD/2 ja jaettu muisti | ✅ Rakennettu. Silmä vaihtuu (seq kasvaa lokissa). |
-| Kuvien lähetys SteamVR:lle (proxy) | ⚠️ Rakennettu. Ensimmäinen testi kaatoi SteamVR:n (DXGI 1.0 -ongelma). Korjaus asennettu, **ei testattu**. |
-| Pään seuranta (HMD-asento → kamera) | ❌ Puuttuu. Kuva on päähän lukittu. |
-| Kypärän FOV ja kuvasuhde | ❌ Puuttuu. Pelin kuva (2052×1133) lähetetään sellaisenaan. |
+| Kuvien lähetys SteamVR:lle (proxy) | ✅ Toimii DXGI 1.1 -korjauksen jälkeen (submitOk kasvaa). |
+| Eri kuva kummallekin silmälle | ⚠️ Kameratila palauttaa edellisen kehyksen siirron (orig ≈ T + cur_prev). `compensate=1` korjaa laskennallisesti, mutta kuva esitetään kehyksen myöhässä, joten tarvitaan `eye_delay=1`. **Ei vielä vahvistettu kypärässä.** `compensate=3` ei toimi. |
+| Valikot, intro ja lataus 2D-ruudulla | ✅ Toimii (käyttäjä vahvisti): IVROverlay-ruutu, kun kameran päivityksiä ei tule. |
+| Pään seuranta (HMD-asento → kamera) | ✅ Kierto toimii (käyttäjä vahvisti 22.42): GetRotation 0x0C, `head_rotation=1`, `head_rot_compensate=0`. Paikka (6DoF) lisätään siirtoon, ei erikseen varmistettu. |
+| Kypärän FOV ja kuvasuhde | ⚠️ Proxy mittaa kypärän (fo4stereo_hmd.txt), rajaa silmäkohtaisesti (`fov_bounds`) ja kirjoittaa ikkunan koon ja FOV:n peliin automaattisesti (`auto_configure=1`). Ikkunan korkeus rajautuu näytön korkeuteen. **Ei vielä vahvistettu kypärässä.** |
 | Gamepad | Toimii flat-pelissä sellaisenaan. Plugin lukee XInputia (vain loki). |
 
 ## Arkkitehtuuri
@@ -34,7 +36,8 @@ Asetukset ovat tiedostossa `D:\SteamLibrary\steamapps\common\Fallout 4\fo4stereo
 
 - `[stereo] enabled=0`: vanha D3D-matriisipaikkaus, pidä pois päältä.
 - `[engine] enabled, mode=stereo|wobble, ipd_units=4.48, amp_units, period_sec`: wobble on heiluntatesti.
-- `[vr] enabled, eye_delay (0/1), swap_eyes (0/1), wait_poses (0/1)`.
+- `[engine] compensate, head_rotation (0/1/2), head_rot_compensate, head_position, units_per_meter`.
+- `[vr] enabled, eye_delay (0/1), swap_eyes (0/1), wait_poses (0/1), flat_after_frames, screen_width_m, screen_distance_m`.
 
 Pikapoisto: `[engine] enabled=0` ja `[vr] enabled=0` palauttavat tavallisen pelin.
 
@@ -113,6 +116,7 @@ Ota varmuuskopio ennen korvaamista (`*.bak`-nimellä pelikansioon, ei `Plugins`-
 - **Vakiopuskurin rivi = 4 floatia** (`f[r*4]`). Aiempi koodi käytti `f[r*16]`, ja se aiheutti muistikorruption.
 - **OpenVR vaatii DXGI 1.1:n.** Fallout 4 käyttää DXGI 1.0:aa → `SharedTexturesNotSupported` (106) ja compositor
   kaatuu. Proxy korvaa adapterin (`GetDxgi11Adapter`).
+- **Fokus:** Fallout 4 pysähtyy ilman ikkunan fokusta (musta kypärä, kunnes ikkunaa klikataan). `Fallout4Custom.ini` `[General] bAlwaysActive=1` ja proxyn `SetForegroundWindow`.
 - **TAA rikkoo silmäsiirron.** `Fallout4Prefs.ini`: `sAntiAliasing=FXAA` (varmuuskopio `.bak_taa`).
 - **Python-heredocit ja kenoviivat:** C-koodin `'\\'`- ja `"C:\\..."`-merkkijonot ovat menneet rikki kahdesti,
   kun koodia lisättiin Pythonilla (`'\'` → käännösvirhe "newline in constant"). Tarkista kenoviivat lisäyksen
@@ -131,10 +135,12 @@ Ota varmuuskopio ennen korvaamista (`*.bak`-nimellä pelikansioon, ei `Plugins`-
 
 ## Seuraavat askeleet (tärkeysjärjestyksessä)
 
-1. **Testaa DXGI 1.1 -korjaus.** Tavoite: `submitOk` kasvaa, eikä SteamVR kaadu. Jos silmät ovat väärin päin
-   tai eivät täsmää, kokeile `swap_eyes=1` ja `eye_delay=1`.
-2. **Pään seuranta:** käytä WaitGetPoses-asentoja (HMD-rotaatio) ja siirrä ne pelin kameraan pluginissa
-   (yaw ja pitch kameratilaan tai kameran juureen). Vaatii proxy → plugin -suunnan jaettuun muistiin.
+1. **Testaa stereo v2.** Tarkista lokista `getTrans`-rivit: `orig` ja `out` kummallekin silmälle (out:n pitää
+   vaihdella ±ipd/2 oikean akselin suuntaan) ja `vr: mode -> 2D screen / 3D stereo`. Jos syvyys on väärin päin:
+   `swap_eyes=1`. Jos silmät eivät täsmää: `eye_delay=1`.
+2. **Pään seuranta:** v2 on rakennettu. Tarkista `getRot`-rivit: jos orig sisältää edellisen kehyksen pään kierron,
+   `head_rot_compensate=1` on oikein. Jos kierto ei juuri liiku, kokeile 0. Jos kierto menee väärään suuntaan,
+   kokeile `head_rotation=2`. Paikka käyttää kameran akseleita, joissa on mukana pään yaw. Oikeampi on vartalon yaw.
 3. **FOV ja kuvasuhde:** lue `GetProjectionRaw`, aseta pelin resoluutio ja FOV (`fDefaultWorldFOV`) vastaamaan
    kypärää tai rajaa kuva `VRTextureBounds_t`:lla.
 4. **Kuvanopeus:** peli käyttää Present(sync=2). Harkitse `iPresentInterval`-asetusta. Fallout 4:n fysiikka on

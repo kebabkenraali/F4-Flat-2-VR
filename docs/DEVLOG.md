@@ -138,6 +138,109 @@ Flat Fallout 4 pelattavaksi VR-laseilla niin, että näkymä täyttää koko nä
   `VRInitError_Compositor_CreateDriverDirectModeResolveTextures`). SteamVR:n ajuri on `vrlink` (Steam Link).
   Korjaus 22.10: kun `[vr] enabled=1`, proxy korvaa pelin adapterin samalla fyysisellä adapterilla
   `CreateDXGIFactory1`:n kautta (LUID-vastaavuus). Ei vielä testattu.
+- **DXGI 1.1 -korjaus toimii (11.11.2026 klo 22.19):** peli pyörii kypärässä, `submitOk` kasvaa, eikä virheitä tule.
+  Käyttäjän havainto: molemmat silmät näyttävät saman kuvan. **Syy:** ensimmäisen persoonan kameratilan
+  alkuperäinen GetTranslation palauttaa paikan, jossa edellisen kehyksen siirto on jo mukana
+  (wobble: out ≈ shift_n + shift_{n-1}; stereo: shift −2.24 → out 0). Vuorottelevat ±IPD/2 kumoavat toisensa.
+- **Stereo v2 (22.25, asennettu, ei testattu):**
+  - Jaettu muisti v2 (`Localo4stereo_shm_v2`): eye, seq, presents, flatMode, HMD-asento seqlockilla.
+  - **Proxy omistaa silmän:** kehyksen silmä = (Present-määrä ennen tätä − eye_delay) & 1. Plugin lukee saman
+    laskurin state-Updatessa.
+  - **Kompensointi:** GetTranslation palauttaa `orig − prevApplied + curApplied` (`[engine] compensate=1`).
+  - **2D-ruutu:** jos kameran päivityksiä (seq) ei tule 20 kehykseen (intro, päävalikko, lataus), proxy näyttää
+    kuvan IVROverlay-ruudulla (3 m leveä, 2 m edessä istuma-avaruudessa) ja lähettää silmille mustaa.
+  - **Pään seuranta:** proxy kirjoittaa WaitGetPoses-asennon (HMD, istuma-avaruus). Plugin koukuttaa kameratilan
+    GetRotationin (0x0C) ja yhdistää pään kierron (VR → peli: q = (w, x, −z, y), `head_rotation` 1/2,
+    `head_rot_compensate`). Pään paikka lisätään siirtoon (`head_position`, `units_per_meter=70`).
+  - Varmuuskopiot: `d3d11_vr_v1.dll.bak`, `Data\F4SEo4flat_probe_stereo1.dll.bak`, `fo4stereo.ini.bak_v1`,
+    `proxy.cpp.bak_vr1`, `main.cpp.bak_stereo1`.
+- **Stereo v2 -testi 22.28:** VR ei käynnistynyt: `VRInitError_Init_HmdNotFound` (108), koska kypärä ei ollut
+  yhteydessä SteamVR:ään pelin käynnistyessä. Siksi 2D-ruutua ja pään seurantaa ei testattu (`pose=false`).
+  Silmä vuorottelee pluginissa (eye 0/1, cur ±ipd/2). 600 kehyksen välein otetut näytteet osuvat aina samaan
+  pariteettiin, joten erottelua ei voi vielä varmistaa. Mallin mukaan (palaute g ≈ 1, `out = orig − prev + cur`)
+  silmät vuorottelevat arvojen 0 ja −2·(ipd/2) välillä, eli erottelu = IPD. Lisätty 22.31: proxy yrittää OpenVR:n
+  käynnistystä 10 s välein (VR_ShutdownInternal epäonnistumisen jälkeen), ja plugin kirjaa jokaisen
+  GetTranslation-kutsun väliltä #4000–#4047 varmistusta varten.
+- **Stereo v2 -testi 22.36 (käyttäjä):** valikot, intro ja latausruutu näkyvät 2D-ruudulla kuten pitää ✅.
+  VR-tilassa molemmat silmät näyttävät edelleen saman kuvan, eikä pään kääntäminen tee juuri mitään.
+  Loki: HMD-asento on kelvollinen (esim. q = 0.901/0.424/…), mutta GetRotationin orig ei sisällä edellisen
+  kehyksen pään kiertoa. Siksi `head_rot_compensate=1` kumosi pään kierron (out ≈ orig). Translaatiossa orig ≈
+  edellisen kehyksen out (feedback), mutta ei tarkasti: out liukuu kohti oikeaa paikkaa, joten
+  `orig − prev + cur` -kompensointi ei pidä silmiä erillään.
+  **Korjaus 22.39:** `compensate=3` (oletus): jokaisen state-Updaten alussa cameraRoot palautetaan siirtämättömään
+  kohtaan (local ja world −= edellinen siirto), ja GetTranslation lisää pelkän `cur`:n. `head_rot_compensate=0`
+  (oletus). Loki kirjaa kutsut #400–#447 ja rootLocal-arvon. Ei vielä testattu.
+- **Testi 22.42 (compensate=3):** **pään kääntäminen toimii ✅** (käyttäjä vahvisti; `head_rot_compensate=0`).
+  Silmät: `compensate=3` ei auta. Kun cameraRoot palautetaan, orig_n ≈ T + cur_{n−1} silti (palaute tulee muualta,
+  todennäköisesti 1. persoonan luurangosta), ja out pysyy samana kummallakin silmällä. Edellisen ajon jäljen
+  (#4–#8, #600) mukaan `compensate=1` antaa oikein out = T + cur, ja peräkkäisten kehysten ero ≈ IPD.
+  Present tapahtuu kesken seuraavan kehyksen GetTranslation-kutsuja (lokissa presents kasvaa kehyksen sisällä),
+  eli kuva esitetään kehyksen myöhässä, ja silmät menivät ristiin. **Asetukset 22.45:** `compensate=1`,
+  `eye_delay=1`, `ipd_units=9` (kaksinkertainen testiä varten, palautetaan 4.48:aan). Varmuuskopio `fo4stereo.ini.bak_v3`.
+  Seuraava iso aihe (käyttäjä): miten kuva renderöidään laseille (FOV, kuvasuhde, projektio).
+- **Fokusongelma (käyttäjä 22.50):** peli ei latautunut eikä näyttänyt kuvaa kypärässä, ennen kuin sen ikkunaa
+  klikattiin hiirellä. Fallout 4 pysähtyy ilman fokusta, ja SteamVR vie fokuksen. Korjaukset:
+  `Documents\My Games\Fallout4\Fallout4Custom.ini` → `[General] bAlwaysActive=1` (varmuuskopio `.bak_focus`,
+  tiedosto pidetty vain luku -tilassa). Proxy antaa pelin ikkunalle fokuksen kerran VR:n käynnistyttyä
+  (`SetForegroundWindow`, loki `vr: focus game window`). Ei vielä testattu.
+- **Kypärän FOV ja kuvasuhde, vaihe 1 (23.05, asennettu, ei testattu):** käyttäjä valitsi vaihtoehdon "pelin
+  resoluutio ja FOV vastaamaan kypärää". Proxy lukee VR:n käynnistyessä IVRSystemistä
+  `GetRecommendedRenderTargetSize`- ja `GetProjectionRaw`-arvot molemmille silmille, kirjaa ne lokiin ja kirjoittaa
+  suosituksen `fo4stereo_hmd.txt`-tiedostoon (ikkunan koko ja fDefaultWorldFOV symmetrisestä kattavasta FOV:sta).
+  Lisäksi Submit käyttää silmäkohtaisia `VRTextureBounds_t`-rajoja, jotka lasketaan pelin todellisesta projektiosta
+  (kamerapuskurin rivit 4/5: tan = 1/x, 1/y). Näin kuva kohdistuu kulmallisesti oikein millä tahansa pelin FOV:lla.
+  Asetus `[vr] fov_bounds=1`. **Vaihe 2:** kun `fo4stereo_hmd.txt` on olemassa, aseta `Fallout4Prefs.ini`:n
+  iSize W/H ja `Fallout4Custom.ini`:n `[Display] fDefaultWorldFOV`/`fDefault1stPersonFOV` suosituksen mukaan.
+  Mittaus: FOV-asetus on vaakasuuntainen (80 → hfov 81° kuvasuhteella 1.81).
+- **Kypärän mittaus (23.10):** Quest 3 (Steam Link) silmäkohtainen suositus 2312×2524. Tangentit
+  vasen l/r/t/b = −1.376/0.839/−1.428/0.966, oikea −0.839/1.376/−1.428/0.966. Kattava symmetrinen FOV 108° × 110°,
+  kuvasuhde 0.964. Pelin FOV-määritelmä selvitettiin: vaakasuuntainen FOV 16:9:llä, ja todellinen hfov skaalautuu
+  Hor+ (asetus 80 → 81.06° kuvasuhteella 1.811, täsmälleen). **Vaihe 2 asetettu:** `Fallout4Prefs.ini` iSize
+  1946×2019 (0.8 × suositus, kuvasuhde 0.964), `Fallout4Custom.ini [Display]` fDefaultWorldFOV ja
+  fDefault1stPersonFOV = 137 (= 108° vaaka kuvasuhteella 0.964). Varmuuskopiot `*.bak_hmdfov`, tiedostot
+  pidetty vain luku -tilassa. Tarkistus: seuraavan ajon loki `vr: eye N bounds ... game tan x≈1.376 y≈1.428`.
+  Jos peli rajoittaa FOV:n, tan on pienempi, ja reunat venyvät (bounds rajautuvat).
+  SetForegroundWindow palautti 0 (fokuksen anto epäonnistui). bAlwaysActive=1 hoitaa tilanteen, jos se toimii.
+- **Testi 23.03:** ikkunan korkeus rajautui näytön mukaan 1133 pikseliin (iSize H=2019 → backbuffer 1946×1133),
+  joten kuvasuhde oli 1.72. Pelin tan x=2.453 (≈136°) ja y=1.428 (110° ✓). Bounds rajasi vaakasuunnassa oikein.
+  Korjaus: iSize 1092×1133 (kuvasuhde 0.964 mahtuu näytölle; FOV 137 → 108° vaaka). Silmät: `compensate=1`
+  antoi molemmille silmille saman out ≈ (0, 0, 120.48). Tällä kertaa orig = T + prev − cur, eli moottori kumosi
+  siirron täysin. **Uusi tapa `compensate=4` (23.05):** silmä- ja pääsiirto asetetaan cameraRootin lapsisolmun
+  (renderöintikamera, nimi lokissa) local.translate-arvoon kameran paikallisissa akseleissa. Kameratila ei lue
+  lasta, joten palautetta ei tule. GetTranslationia ei muuteta. Ei vielä testattu. Varmuuskopiot `main.cpp.bak_v3`,
+  `Data\F4SEo4flat_probe_v3.dll.bak`, `fo4stereo.ini.bak_v4`.
+- **Käyttäjän havainnot (23.03-ajo, compensate=1, ipd 9):** "hieman kaksoiskuvaa esim. kun NPC on ihan vieressä;
+  tähtääminen sekoittaa näkymän; kameran liikkeissä lagia; Pip-Boy pitäisi skaalata paremmin tai näyttää muuten kuin
+  VR:ssä." Kaksoiskuva lähellä tarkoittaa, että silmät erosivat jonkin verran. Silmäväli oli kaksinkertainen (9).
+  Tehty 23.10: `ipd_units=4.48` (todellinen). Proxy: `[vr] no_vsync=1`, eli VR:n aikana Present kutsutaan sync 0:lla,
+  koska peli käytti sync=2 (30 fps 60 Hz:llä) ja WaitGetPoses tahdistaa kehykset kypärän mukaan. Avoinna:
+  tähtäys (zoom kaventaa pelin FOV:n, ja bounds venyttää kuvan; ratkaisuna ADS-zoomin ohitus VR:ssä tai
+  FOV:n lukitus) ja Pip-Boy 2D-ruudulle (tarvitsee valikkotunnistuksen, esim. RTTI:llä löydetty UI +
+  MenuOpenCloseEvent). Fallout 4:n fysiikka on sidottu kuvanopeuteen, joten yli 60 fps voi aiheuttaa ongelmia
+  (Quest 72 Hz suositeltava).
+- **Automaattinen kypäräkonfigurointi (23.20, asennettu, ei testattu):** `[vr] auto_configure=1`. Kun VR
+  käynnistyy, proxy laskee mitatusta näkökentästä ikkunan (kypärän kuvasuhde, korkeus = min(suositus,
+  työalueen korkeus − ikkunan reunat)) ja FOV:n kaavalla `2·atan(tan(hfov/2)·(16/9)/kuvasuhde)`. Arvot kirjoitetaan
+  tiedostoihin `Documents\My Games\Fallout4\Fallout4Prefs.ini [Display] iSize W/H` ja
+  `Fallout4Custom.ini [Display] fDefaultWorldFOV/fDefault1stPersonFOV` (Documents-polku SHGetKnownFolderPath-
+  funktiolla). Kirjoitus tehdään vain muuttuneille arvoille. Vain luku -tila säilytetään, ja kertaluonteinen
+  varmuuskopio tehdään nimellä `*.bak_fo4stereo`. Muutokset tulevat voimaan seuraavalla käynnistyksellä
+  (loki: `vr: auto-config ... UPDATED, restart the game`). Toimii mille tahansa SteamVR-laseille.
+- **Testi 23.14 (compensate=4 + auto-config):** käyttäjä: "much better". Loki: renderöintikamera `WorldRoot Camera`
+  (cameraRootin lapsi 0) saa silmäkohtaisen siirron (x −0.99 / +3.48, ero = IPD) ✅. Pelin tan 1.376/1.428 vastaa
+  kypärää täsmälleen ✅. Auto-config kirjoitti ikkunan 1026×1065 (työalueen raja). Avoinna käyttäjältä: Pip-Boy
+  liian suuri, tähtäyksessä kaksoiskuva ja VATS ei toimi.
+  **Korjaukset 23.18 (asennettu, ei testattu):** proxy tunnistaa zoomin pelin projektiosta
+  (suhde = pelin tan / kypärän tan: < aim_ratio 0.95 → tähtäys, < pipboy_ratio 0.5 → Pip-Boy) ja kirjoittaa sen
+  jaettuun muistiin (`zoom`). Plugin kirjoittaa aktiivisen kameratilan (`camState`). Tähtäyksessä silmäsiirto
+  × `aim_ipd_scale` (0 = mono). Pip-Boy (zoom 2) ja muut kameratilat kuin 1. persoona (VATS 2, dialogi,
+  3. persoona…) näytetään 2D-ruudulla (`pipboy_2d`, `other_cams_2d`). Stereo ja pään seuranta vain kameratilassa 0.
+  Loki: `vr: zoom=N (game tan x=…, ratio …) camState=N` tilan vaihtuessa, joten kynnysarvot voi kalibroida.
+- **Testi 23.22:** tähtäys toimii (mono) ✅, Pip-Boy 2D:nä ✅, VATS 2D:nä ✅. Kolmas persoona näkyi 2D:nä, vaikka sen
+  pitäisi olla VR:ssä. Loki: kolmas persoona raportoituu kameratilana 7, koska tilat 7 ja 8 jakavat vtablen ja
+  plugin rekisteröi ensimmäisen. Mitatut zoomit: tähtäys 0.944–0.949, Pip-Boy 0.445–0.454 (välissä 0.53 ja 0.82
+  siirtymissä). **Korjaus 23.26:** `[vr] vr_cam_states=0,7` (proxy ja plugin) määrää VR:ssä näytettävät kameratilat.
+  Muut näytetään 2D:nä. Stereo ja pään seuranta koskevat näitä tiloja. Ei vielä testattu.
 - Aiempi havainto (vanha kaappaus, "cbPass"=cb0 12×float4, r00–r03 näkymärotaatio ilman translaatiota,
   r04–r07 projektiomatriisi, r08–r11 = P·R) vastaa samoja kenttiä — uusi analyysi täydensi sen
   kamerapaikkavakiolla ja kokonaisrakenteella.
