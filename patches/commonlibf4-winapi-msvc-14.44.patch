@@ -1,0 +1,15 @@
+diff --git a/CommonLibF4/include/F4SE/Impl/WinAPI.h b/CommonLibF4/include/F4SE/Impl/WinAPI.h
+index 1af5822..e5c91a3 100644
+--- a/CommonLibF4/include/F4SE/Impl/WinAPI.h
++++ b/CommonLibF4/include/F4SE/Impl/WinAPI.h
+@@ -2,8 +2,8 @@
+ 
+ namespace F4SE::WinAPI
+ {
+-	inline constexpr auto(MEM_RELEASE){ static_cast<std::uint32_t>(0x00008000) };
+-	inline constexpr auto(PAGE_EXECUTE_READWRITE){ static_cast<std::uint32_t>(0x40) };
++	inline constexpr std::uint32_t MEM_RELEASE{ static_cast<std::uint32_t>(0x00008000) };
++	inline constexpr std::uint32_t PAGE_EXECUTE_READWRITE{ static_cast<std::uint32_t>(0x40) };
+ 
+ 	struct CRITICAL_SECTION
+ 	{

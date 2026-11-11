@@ -1,0 +1,23 @@
+# build output
+build/
+b/
+out/
+*.dll
+*.lib
+*.exp
+*.pdb
+*.obj
+
+# vcpkg
+vcpkg_installed/
+
+# logs, captures, dumps
+*.log
+*.rdc
+*.bin
+camdump_*.txt
+cbpass_dump.txt
+
+# backups
+*.bak
+*.bak_*
