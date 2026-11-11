@@ -68,7 +68,7 @@ poistamista: `fo4stereo.ini`:ssä `[engine] enabled=0` ja `[vr] enabled=0`.
 
 ## Lisenssi ja lähteen mainitseminen
 
-[MIT](LICENSE). Saat käyttää, muokata ja jakaa koodia vapaasti, myös kaupallisesti, kunhan lisenssiteksti ja
+[MIT](LICENSE) (kolmannen osapuolen osat: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). Saat käyttää, muokata ja jakaa koodia vapaasti, myös kaupallisesti, kunhan lisenssiteksti ja
 tekijänoikeusmerkintä säilyvät, eli **mainitset lähteenä kebabkenraalin ja tämän projektin**.
 
 Kolmannen osapuolen osat: OpenVR-otsake (Valve, BSD-3) ja CommonLibF4 (MIT). Projekti ei sisällä pelin
