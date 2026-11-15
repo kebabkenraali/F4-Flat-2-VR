@@ -112,11 +112,13 @@ All settings live in `fo4stereo.ini` next to `Fallout4.exe`. The most-used setti
 
 ## Tools used
 
+
 - **Visual Studio 2022 Build Tools** (MSVC 14.44), **CMake**, **Ninja**, **vcpkg**
 - **F4SE** (script extender runtime) and **Address Library for F4SE Plugins**
 - **RenderDoc** for frame captures (research only)
 - **SteamVR / OpenVR** and **Steam Link** with a Meta Quest 3 for testing
 - **Git**, and **Cline** (Anthropic) as an AI pair programmer during development
+- **AI-assisted development.** This project was developed with the help of AI tools (Cline / Claude, Anthropic). AI was used for code writing, debugging, documentation, packaging and testing guidance. All code was reviewed and tested by the author.
 
 ## Third-party code and credits
 
@@ -127,6 +129,7 @@ All settings live in `fo4stereo.ini` next to `Fallout4.exe`. The most-used setti
 | F4SE `PluginAPI.h` | The `F4SEPluginVersionData` struct layout is reproduced in `plugin/src/main.cpp` so F4SE 0.7.x loads the plugin | F4SE own terms |
 | [FRIK, Fallout 4 VR Body](https://github.com/rollingrock/Fallout-4-VR-Body) | **No code copied.** Source was read as a reference for how the VR game handles the camera root node. | - |
 | [Cline](https://cline.bot) (Anthropic) | AI pair programmer: code fixes, documentation, FOMOD packaging, debugging | - |
+- **AI-assisted development.** This project was developed with the help of AI tools (Cline / Claude, Anthropic). AI was used for code writing, debugging, documentation, packaging and testing guidance. All code was reviewed and tested by the author.
 
 All other code in `plugin/src` and `proxy/src` was written for this project. Details are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
