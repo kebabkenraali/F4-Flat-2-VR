@@ -10,7 +10,7 @@ Play the regular (flat) **Fallout 4** in a **VR headset** with real stereo 3D, h
 
 | Feature | How |
 |---|---|
-| Stereo 3D in gameplay | The engine's own render camera is offset by ±IPD/2 per frame, so shadows, glass, lighting and effects stay correct |
+| Stereo 3D in gameplay | The engine's own render camera is offset by Ãƒâ€šÃ‚Â±IPD/2 per frame, so shadows, glass, lighting and effects stay correct |
 | Output to the headset | Each frame goes to the matching eye texture and both eyes are submitted to SteamVR (OpenVR) |
 | Head rotation (and position) | HMD pose from SteamVR is applied to the game's camera |
 | Menus, intro, loading, Pip-Boy, VATS, dialogue | Shown on a virtual 2D screen in VR |
@@ -24,6 +24,13 @@ Known limitations:
 - **No motion controllers.** Play with a gamepad (Xbox controller) or mouse and keyboard.
 - **Window height is limited.** It cannot exceed your desktop height, which limits sharpness. NVIDIA DSR/DLDSR helps.
 - **Physics are tied to frame rate.** Fallout 4's physics follow the frame rate. A 72 Hz headset refresh rate is a safe choice.
+
+
+Known issues (15.11.2026):
+
+- **Aiming double vision** - mono-aim detection (`aim_ratio`) may not trigger. Check `fo4stereo_proxy.log` for `vr: zoom=1` when aiming. If zoom stays 0, lower `aim_ratio`.
+- **Camera slightly off-centre** - convergence toe-in (`convergence_m=1.5`) may shift view. Set `convergence_m=0` to test.
+- **Power armor exit animation** - vanilla FO4 bug, not caused by this mod.
 
 ## How it works
 
@@ -77,10 +84,16 @@ cmake --build plugin/b
 
 ## Configuration (`fo4stereo.ini`)
 
+The most-used settings can also be changed in-game through the **Mod Configuration Menu** (requires the
+[MCM](https://www.nexusmods.com/fallout4/mods/21497) mod): pause menu ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ *Mod Config* ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ *F4 Flat 2 VR*.
+Stereo settings apply immediately; the VR settings are pushed to the proxy through shared memory. Menu
+files live in `Data\MCM\Config\F4Flat2VR\` (`mcm/` in the repo, deploy with `deploy_mcm.ps1`); the MCM
+stores your changes in `Data\MCM\Settings\F4Flat2VR.ini`.
+
 | Section | Key | Meaning |
 |---|---|---|
 | `[engine]` | `enabled`, `mode=stereo\|wobble` | Eye offset on the engine camera. `wobble` is a sideways sway test. |
-| | `ipd_units` | Eye distance in game units. 4.48 = 64 mm (1 unit ≈ 1.43 cm). |
+| | `ipd_units` | Eye distance in game units. 4.48 = 64 mm (1 unit ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  1.43 cm). |
 | | `compensate=4` | Eye offset method: 4 = render-camera node (works). 1 and 3 are older experiments. |
 | | `head_rotation` (0/1/2), `head_rot_compensate`, `head_position`, `units_per_meter` | Head tracking |
 | | `aim_ipd_scale` | Eye separation while aiming (0 = mono) |
@@ -88,6 +101,8 @@ cmake --build plugin/b
 | | `flat_after_frames`, `screen_width_m`, `screen_distance_m` | 2D screen for menus and loading |
 | | `fov_bounds`, `auto_configure` | Per-eye crop and automatic window size and FOV |
 | | `aim_ratio`, `pipboy_ratio`, `pipboy_2d`, `other_cams_2d`, `vr_cam_states` | Zoom detection, and which camera states are shown in VR (0 first person, 7 third person) |
+| | `upscale`, `upscale_sharpness` | FSR1 spatial upscale of the game frame to the headset's recommended per-eye resolution (non-temporal, VR-safe) |
+| | `pipboy_projected`, `pipboy_target_index`, `pipboy_screen_width_m`, `pipboy_screen_distance_m`, `pipboy_screen_height_m` | Pip-Boy: the game renders the Pip-Boy UI to its own render target; when it is open it is shown on a second 2D overlay instead of being projected into the world (size and position in meters). `pipboy_target_index` picks the target when several match the expected size. |
 | `[stereo]` | `enabled=0` | Old D3D matrix-patching experiment. Keep it off. |
 
 ## Tools used
@@ -105,7 +120,7 @@ cmake --build plugin/b
 | [CommonLibF4](https://github.com/Ryan-rsm-McKenzie/CommonLibF4) by Ryan McKenzie | Git submodule, with a small patch for MSVC 14.44 (`patches/`) | MIT |
 | [OpenVR](https://github.com/ValveSoftware/openvr) header `openvr.h` by Valve | Included unchanged in `proxy/external/openvr/` | BSD 3-Clause |
 | F4SE `PluginAPI.h` | The `F4SEPluginVersionData` struct layout is reproduced in `plugin/src/main.cpp` so F4SE 0.7.x loads the plugin | F4SE's own terms |
-| [FRIK, Fallout 4 VR Body](https://github.com/rollingrock/Fallout-4-VR-Body) | **No code copied.** Its source was read as a reference for how the VR game handles the camera root node. | — |
+| [FRIK, Fallout 4 VR Body](https://github.com/rollingrock/Fallout-4-VR-Body) | **No code copied.** Its source was read as a reference for how the VR game handles the camera root node. | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â |
 
 All other code in `plugin/src` and `proxy/src` was written for this project. Details are in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
@@ -117,3 +132,13 @@ as you keep the license notice and **credit kebabkenraali** as the source.
 
 This project contains no game files and is not affiliated with or endorsed by Bethesda Softworks or ZeniMax
 Media. Fallout is a trademark of ZeniMax Media.
+## New fixes (13.11.2026)
+
+- **FSR1 dispatch:** was 1D-layout `Dispatch(95912, 1)`, over D3D11's 65535 limit, fixed with 8x8 tiles `Dispatch(304, 316, 1)`.
+- **EASU sampler:** was never bound (black output), fixed by creating a linear-clamp sampler and binding via `CSSetSamplers`.
+- **RCAS:** read `midA` while still bound as UAV, fixed by unbinding UAV before SRV bind.
+- **Mouse capture:** ClipCursor removed entirely; cursor now moves freely on desktop when game is backgrounded.
+- **Aiming/Pip-Boy zoom:** `pipboy_ratio` 0.5 -> 0.75, `aim_ratio` 0.98 -> 0.95, `aim_ipd_scale=0` (mono); hysteresis holds until `aim_ratio + 0.015`.
+- **Instrumentation:** proxy logs `vr: eye N bounds ...` on change; plugin logs `aim {}` and `conv yaw=... rad (... deg) eye=...`.
+- **Build & deploy:** proxy and plugin rebuilt, d3d11.dll and fo4flat_probe.dll deployed to D:\SteamLibrary\steamapps\common\Fallout 4.
+

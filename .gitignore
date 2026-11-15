@@ -1,23 +1,14 @@
-# build output
-build/
-b/
-out/
+# Build artifacts
+Nexusmods/
+*.zip
 *.dll
-*.lib
-*.exp
-*.pdb
-*.obj
+plugin/b/
+proxy/build/
 
-# vcpkg
-vcpkg_installed/
+# IDE
+.vs/
+.idea/
 
-# logs, captures, dumps
-*.log
-*.rdc
-*.bin
-camdump_*.txt
-cbpass_dump.txt
-
-# backups
-*.bak
-*.bak_*
+# Temp
+tmp/
+build/

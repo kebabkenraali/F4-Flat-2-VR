@@ -15,6 +15,8 @@
 #include <xinput.h>
 #include <atomic>
 #include <chrono>
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -136,7 +138,10 @@ static int g_headRotMode = 1;        // [engine] head_rotation: 0 off, 1 cam*hea
 static bool g_headRotComp = false;   // [engine] head_rot_compensate
 static bool g_headPos = true;        // [engine] head_position
 static float g_unitsPerMeter = 70.0f;  // [engine] units_per_meter
-static float g_aimIpdScale = 0.0f;    // [engine] aim_ipd_scale
+static float g_aimIpdScale = 0.0f;    // [engine] aim_ipd_scale: signed eye offset while aiming,
+                                      // +1 = right eye's position, -1 = left, 0 = centre (mono either way)
+static float g_convergeM = 1.5f;      // [engine] convergence_m (0 = parallel eyes)
+static float g_curConvYaw = 0.0f;     // per-frame toe-in yaw for the current eye (rad)
 static unsigned g_vrCamMask = (1u << 0) | (1u << 7);  // [vr] vr_cam_states
 static RE::NiPoint3 g_lastWritten{};
 static RE::NiPoint3 g_lastOffset{};
@@ -179,6 +184,8 @@ static void LoadEngineConfig()
 	g_unitsPerMeter = static_cast<float>(std::atof(buf));
 	GetPrivateProfileStringA("engine", "aim_ipd_scale", "0", buf, sizeof(buf), ini.c_str());
 	g_aimIpdScale = static_cast<float>(std::atof(buf));
+	GetPrivateProfileStringA("engine", "convergence_m", "1.5", buf, sizeof(buf), ini.c_str());
+	g_convergeM = static_cast<float>(std::atof(buf));
 	GetPrivateProfileStringA("vr", "vr_cam_states", "0,7", buf, sizeof(buf), ini.c_str());
 	g_vrCamMask = 0;
 	for (char* p = buf; *p;) {
@@ -188,9 +195,148 @@ static void LoadEngineConfig()
 		if (*p && (*p < '0' || *p > '9')) break;
 	}
 	spdlog::info("vr camera states mask=0x{:X}", g_vrCamMask);
-	spdlog::info("engine mode={} ipd_units={} compensate={} head_rotation={} head_rot_compensate={} head_position={} units_per_meter={}",
-		g_engStereo ? "stereo" : "wobble", g_engIpd, g_compensate, g_headRotMode, g_headRotComp, g_headPos, g_unitsPerMeter);
+	spdlog::info("engine mode={} ipd_units={} compensate={} head_rotation={} head_rot_compensate={} head_position={} units_per_meter={} convergence_m={}",
+		g_engStereo ? "stereo" : "wobble", g_engIpd, g_compensate, g_headRotMode, g_headRotComp, g_headPos, g_unitsPerMeter, g_convergeM);
 	spdlog::info("engine stereo test: enabled={} amp_units={} period_sec={}", g_engEnabled, g_engAmp, g_engPeriod);
+}
+
+// ---------------------------------------------------------------------------
+// MCM (Mod Configuration Menu): the menu writes user settings to
+// <game>\Data\MCM\Settings\F4Flat2VR.ini (MCM core, Data\MCM\Config\F4Flat2VR).
+// A poll thread watches the file and applies changes live: the stereo values
+// to the engine hooks here, the VR values through the shared-memory settings
+// block to the proxy.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_mcmPollRunning{ false };
+static FILETIME g_mcmLastWrite{};
+static bool g_mcmHave = false;
+
+static std::string McmSettingsPath()
+{
+	return GameDirA() + "Data\\MCM\\Settings\\F4Flat2VR.ini";
+}
+
+static bool McmFileTime(FILETIME* ft)
+{
+	WIN32_FILE_ATTRIBUTE_DATA d{};
+	if (!GetFileAttributesExA(McmSettingsPath().c_str(), GetFileExInfoStandard, &d)) {
+		return false;
+	}
+	*ft = d.ftLastWriteTime;
+	return true;
+}
+
+static float McmReadF(const char* ini, const char* sec, const char* key, float cur)
+{
+	char buf[64]{};
+	char def[32];
+	snprintf(def, sizeof(def), "%.5f", static_cast<double>(cur));
+	GetPrivateProfileStringA(sec, key, def, buf, sizeof(buf), ini);
+	const float v = static_cast<float>(std::atof(buf));
+	return std::isfinite(v) ? v : cur;
+}
+
+static int McmReadI(const char* ini, const char* sec, const char* key, int cur)
+{
+	char buf[64]{};
+	char def[32];
+	snprintf(def, sizeof(def), "%d", cur);
+	GetPrivateProfileStringA(sec, key, def, buf, sizeof(buf), ini);
+	return std::atoi(buf);
+}
+
+static bool McmReadB(const char* ini, const char* sec, const char* key, bool cur)
+{
+	return McmReadI(ini, sec, key, cur ? 1 : 0) != 0;
+}
+
+static void ApplyMcm()
+{
+	FILETIME ft{};
+	if (!McmFileTime(&ft)) {
+		return;  // no MCM settings file (MCM not installed or menu not used yet)
+	}
+	if (g_mcmHave && ft.dwLowDateTime == g_mcmLastWrite.dwLowDateTime &&
+		ft.dwHighDateTime == g_mcmLastWrite.dwHighDateTime) {
+		return;
+	}
+	g_mcmHave = true;
+	g_mcmLastWrite = ft;
+	const std::string ini = McmSettingsPath();
+
+	// Stereo -> engine hooks (applied on the next camera update).
+	float v = McmReadF(ini.c_str(), "Stereo", "fIPDUnits", g_engIpd);
+	v = std::clamp(v, 0.0f, 20.0f);
+	if (v != g_engIpd) {
+		spdlog::info("mcm: ipd_units {} -> {}", g_engIpd, v);
+		g_engIpd = v;
+	}
+	const int rot = std::clamp(McmReadI(ini.c_str(), "Stereo", "iHeadRotation", g_headRotMode), 0, 2);
+	if (rot != g_headRotMode) {
+		spdlog::info("mcm: head_rotation {} -> {}", g_headRotMode, rot);
+		g_headRotMode = rot;
+	}
+	const bool rotComp = McmReadB(ini.c_str(), "Stereo", "bHeadRotComp", g_headRotComp);
+	if (rotComp != g_headRotComp) {
+		spdlog::info("mcm: head_rot_compensate {} -> {}", g_headRotComp ? 1 : 0, rotComp ? 1 : 0);
+		g_headRotComp = rotComp;
+	}
+	const bool pos = McmReadB(ini.c_str(), "Stereo", "bHeadPos", g_headPos);
+	if (pos != g_headPos) {
+		spdlog::info("mcm: head_position {} -> {}", g_headPos ? 1 : 0, pos ? 1 : 0);
+		g_headPos = pos;
+	}
+	v = McmReadF(ini.c_str(), "Stereo", "fUnitsPerMeter", g_unitsPerMeter);
+	v = std::clamp(v, 1.0f, 1000.0f);
+	if (v != g_unitsPerMeter) {
+		spdlog::info("mcm: units_per_meter {} -> {}", g_unitsPerMeter, v);
+		g_unitsPerMeter = v;
+	}
+	v = McmReadF(ini.c_str(), "Stereo", "fAimIpdScale", g_aimIpdScale);
+	v = std::clamp(v, -2.0f, 2.0f);
+	if (v != g_aimIpdScale) {
+		spdlog::info("mcm: aim_ipd_scale {} -> {}", g_aimIpdScale, v);
+		g_aimIpdScale = v;
+	}
+	v = McmReadF(ini.c_str(), "Stereo", "fConvergeM", g_convergeM);
+	v = std::clamp(v, 0.0f, 100.0f);
+	if (v != g_convergeM) {
+		spdlog::info("mcm: convergence_m {} -> {}", g_convergeM, v);
+		g_convergeM = v;
+	}
+
+	// VR -> the proxy through the shared settings block.
+	if (g_shm) {
+		StereoSettings c{};
+		c.valid = 1;
+		c.ipdUnits = g_engIpd;
+		c.aimIpdScale = g_aimIpdScale;
+		c.convergeM = g_convergeM;
+		c.unitsPerMeter = g_unitsPerMeter;
+		c.aimRatio = std::clamp(McmReadF(ini.c_str(), "VR", "fAimRatio", 0.95f), 0.1f, 1.0f);
+		c.pipboyRatio = std::clamp(McmReadF(ini.c_str(), "VR", "fPipboyRatio", 0.75f), 0.1f, 1.0f);
+		c.screenWidthM = std::clamp(McmReadF(ini.c_str(), "VR", "fScreenWidth", 3.0f), 0.1f, 20.0f);
+		c.screenDistanceM = std::clamp(McmReadF(ini.c_str(), "VR", "fScreenDist", 2.0f), 0.1f, 20.0f);
+		c.pipWidthM = std::clamp(McmReadF(ini.c_str(), "VR", "fPipWidth", 0.8f), 0.1f, 10.0f);
+		c.pipDistanceM = std::clamp(McmReadF(ini.c_str(), "VR", "fPipDist", 2.0f), 0.1f, 10.0f);
+		c.upscaleSharpness = std::clamp(McmReadF(ini.c_str(), "VR", "fUpSharp", 0.1f), 0.0f, 2.0f);
+		c.eyeDelay = McmReadB(ini.c_str(), "VR", "bEyeDelay", false) ? 1 : 0;
+		c.swapEyes = McmReadB(ini.c_str(), "VR", "bSwapEyes", false) ? 1 : 0;
+		c.waitPoses = McmReadB(ini.c_str(), "VR", "bWaitPoses", true) ? 1 : 0;
+		WriteStereoSettings(&g_shm->cfg, c);
+		spdlog::info("mcm: settings applied (ipd {:.2f} headRot {} eyeDelay {} swap {} waitPoses {} aimRatio {:.2f} pipboyRatio {:.2f})",
+			g_engIpd, g_headRotMode, c.eyeDelay, c.swapEyes, c.waitPoses, c.aimRatio, c.pipboyRatio);
+	}
+}
+
+static void PollMcm()
+{
+	spdlog::info("mcm: poll thread started ({})", McmSettingsPath());
+	while (g_mcmPollRunning.load()) {
+		ApplyMcm();
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+	}
+	spdlog::info("mcm: poll thread stopped");
 }
 
 static void HookedCamUpdate(RE::TESCamera* a_self)
@@ -448,7 +594,14 @@ static void HookedStateUpdate(RE::TESCameraState* a_self, void* a_next)
 	// number of frames presented so far (the frame being prepared is the next one).
 	long eye = g_eye.load();
 	if (g_engStereo) {
-		eye = g_shm ? (g_shm->presents & 1) : (eye ^ 1);
+		// Strict per-update alternation, in lockstep with the camera shift
+		// below (both use this `eye`). The old scheme derived the eye from the
+		// present counter: a present can land before OR after the next camera
+		// update (render thread vs game thread race), and whenever it did, an
+		// eye repeated - the same eye's view rendered twice while the other
+		// eye's texture kept a stale frame - a constant left-right wobble.
+		// Self-alternation cannot drift; the proxy follows the recorded eye.
+		eye ^= 1;
 		g_eye.store(eye);
 		if (g_shm) {
 			InterlockedExchange(&g_shm->eye, eye);
@@ -467,6 +620,20 @@ static void HookedStateUpdate(RE::TESCameraState* a_self, void* a_next)
 	// stereo/head tracking only for the camera states shown in VR ([vr] vr_cam_states)
 	const bool firstPerson = g_curStateIdx >= 0 && g_curStateIdx < 32 && (g_vrCamMask & (1u << g_curStateIdx));
 	const bool aiming = g_shm && g_shm->zoom == 1;
+
+	// Reset head rotation state when transitioning from a non-VR camera state
+	// (Pip-Boy, VATS, dialogue) back to a VR state. Without this, stale
+	// g_curHeadQ/g_prevHeadQ from before the menu froze the view on return.
+	{
+		static int s_prevStateIdx = -1;
+		const bool wasVR = s_prevStateIdx >= 0 && s_prevStateIdx < 32 && (g_vrCamMask & (1u << s_prevStateIdx));
+		if (firstPerson && !wasVR) {
+			std::memcpy(g_curHeadQ, "\x00\x00\x80\x3F\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", sizeof(g_curHeadQ));
+			std::memcpy(g_prevHeadQ, g_curHeadQ, sizeof(g_curHeadQ));
+			spdlog::info("head rotation reset (state {} -> {})", s_prevStateIdx, g_curStateIdx);
+		}
+		s_prevStateIdx = g_curStateIdx;
+	}
 
 	// Camera axes of the last rendered frame (rows of the world rotation).
 	RE::NiPoint3 right{ 1.0f, 0.0f, 0.0f }, fwd{ 0.0f, 1.0f, 0.0f }, up{ 0.0f, 0.0f, 1.0f };
@@ -518,12 +685,61 @@ static void HookedStateUpdate(RE::TESCameraState* a_self, void* a_next)
 	std::memcpy(g_prevHeadQ, g_curHeadQ, sizeof(g_curHeadQ));
 
 	RE::NiPoint3 applied{ 0.0f, 0.0f, 0.0f };
+	float shift = 0.0f;
+	// Aim handling is first-person only (state 0). The 3rd-person state (7; it
+	// shares its vtable with 8) shows the character holding the weapon at
+	// roughly 1-2 m, where plain stereo is correct; the sideways mono offset
+	// made the aiming view look displaced there.
+	const bool aimFp = aiming && g_curStateIdx == 0;
 	if (g_engEnabled && firstPerson) {
-		float shift = g_engStereo ? (eye == 0 ? -0.5f : 0.5f) * g_engIpd : CurrentShift();
-		if (aiming) shift *= g_aimIpdScale;  // sights right at the eye: mono avoids double vision
+		if (aimFp) {
+			// Signed mono offset while aiming: the value is the eye position as a
+			// fraction of half the IPD (-1 = the left eye's position, 0 = centre,
+			// +1 = the right eye's, |value| > 1 pushes further out). Both frames
+			// use the SAME offset, so the sights show a single image (no double
+			// vision) from wherever the user actually sights; negative values are
+			// how a left-dominant user gets the correct view.
+			shift = g_aimIpdScale * 0.5f * g_engIpd;
+		} else {
+			shift = g_engStereo ? (eye == 0 ? -0.5f : 0.5f) * g_engIpd : CurrentShift();
+		}
 		applied.x += right.x * shift;
 		applied.y += right.y * shift;
 		applied.z += right.z * shift;
+	}
+
+	// Convergence (toe-in): yaw each eye toward the centreline so near objects
+	// (weapon at arm's length, people closer than ~2 m) fuse without cross-eyed
+	// strain. Only for the alternating stereo frames: with the mono aim view
+	// both frames would rotate the SAME way, which just turns the whole view
+	// (and the crosshair with it) away from the engine's bullet path.
+	g_curConvYaw = 0.0f;
+	if (g_engEnabled && firstPerson && !aimFp && g_convergeM > 0.0f && g_engIpd > 0.0f) {
+		const float half = 0.5f * g_engIpd;
+		const float dist = g_convergeM * g_unitsPerMeter;
+		if (half > 0.0f && dist > 0.0f) {
+			const float theta = std::atan2(half, dist);
+			// Sign from the shift direction: the eye at -IPD/2 (left) turns
+			// right, the eye at +IPD/2 turns left (local +Z yaw = left).
+			g_curConvYaw = (shift <= 0.0f) ? -theta : theta;
+		}
+	}
+
+	// Instrument: prove whether mono (aim) and the toe-in yaw are actually active
+	// when double vision is reported while aiming.
+	{
+		static bool s_aimPrev = false;
+		if (aiming != s_aimPrev) {
+			spdlog::info("aim {} (shm zoom={}) ipdScale={}", aiming ? 1 : 0,
+				g_shm ? static_cast<int>(g_shm->zoom) : -1, g_aimIpdScale);
+			s_aimPrev = aiming;
+		}
+		static float s_yawPrev = 1e9f;
+		if (std::fabs(g_curConvYaw - s_yawPrev) > 1e-5f) {
+			spdlog::info("conv yaw={:.4f} rad ({:.2f} deg) eye={}", g_curConvYaw,
+				g_curConvYaw * 57.2957795f, static_cast<int>(eye));
+			s_yawPrev = g_curConvYaw;
+		}
 	}
 
 	// Head pose from the proxy (OpenVR seated space, metres; x right, y up, -z forward).
@@ -623,6 +839,15 @@ static void HookedGetRotation(const RE::TESCameraState* a_self, RE::NiQuaternion
 	} else {
 		QuatMul(head, cam, out);
 	}
+	// Per-eye convergence: yaw about the camera's own up axis (local post-multiply).
+	// Set in HookedStateUpdate for the frame's eye; 0 = parallel eyes.
+	if (g_curConvYaw != 0.0f) {
+		const float h = g_curConvYaw * 0.5f;
+		const float yaw[4] = { std::cos(h), 0.0f, 0.0f, std::sin(h) };
+		float tmp[4];
+		QuatMul(out, yaw, tmp);
+		std::memcpy(out, tmp, sizeof(out));
+	}
 	QuatNormalize(out);
 	a_rot.w = out[0];
 	a_rot.x = out[1];
@@ -705,6 +930,13 @@ static void InstallCameraHook()
 		}
 	}
 	LoadEngineConfig();
+	// LoadEngineConfig re-reads fo4stereo.ini and overwrites every stereo value,
+	// including the ones the MCM poll thread applied at startup (the poll only
+	// re-applies when the MCM ini's file time changes, so the stomp would stick
+	// for the whole session - aim scale, convergence and rotation compensation
+	// silently dead in game). Force a re-apply of the MCM values.
+	g_mcmHave = false;
+	ApplyMcm();
 	QueryPerformanceFrequency(&g_qpf);
 	QueryPerformanceCounter(&g_qpc0);
 
@@ -725,6 +957,7 @@ static void InstallCameraHook()
 	g_cam = cam;
 	g_shm = OpenStereoShm();
 	spdlog::info("stereo shm {}", g_shm ? "open" : "FAILED");
+	ApplyMcm();  // push existing MCM settings into the shm cfg block on first hook install
 	HookCameraStates(cam);
 }
 
@@ -738,6 +971,9 @@ static void OnMessage(F4SE::MessagingInterface::Message* a_msg)
 		spdlog::info("game data ready");
 		if (!g_pollRunning.exchange(true)) {
 			std::thread(PollGamepad).detach();
+		}
+		if (!g_mcmPollRunning.exchange(true)) {
+			std::thread(PollMcm).detach();
 		}
 	}
 }

@@ -1,0 +1,213 @@
+{
+    "modName": "F4Flat2VR",
+    "displayName": "F4 Flat 2 VR",
+    "minMcmVersion": 2,
+    "pluginRequirements": [],
+    "pages": [
+        {
+            "pageDisplayName": "Stereo",
+            "content": [
+                {
+                    "text": "Stereo- ja päänseuranta-asetukset. Muutokset otetaan käyttöön heti, ilman uudelleenkäynnistystä.",
+                    "type": "text"
+                },
+                {
+                    "text": "Silmäetäisyys (IPD)",
+                    "id": "fIPDUnits:Stereo",
+                    "type": "slider",
+                    "help": "Silmien etäisyys peliyksiköissä. 4.48 = 64 mm (1 yksikkö ≈ 1,43 cm). Suurenna jos syvyysvaikutelma on liian pieni, pienennä jos silmät väsyvät.",
+                    "valueOptions": {
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.1,
+                        "sourceType": "ModSettingFloat"
+                    }
+                },
+                {
+                    "text": "Pään kierron tila",
+                    "id": "iHeadRotation:Stereo",
+                    "type": "stepper",
+                    "help": "Miten HMD:n kierto sovelletaan pelin kameraan: Pois, kamera kertoen pään kierto (1) tai pään kierto kertoen kameran (2). Jos kierto näkyy väärään suuntaan, vaihda tilaa.",
+                    "valueOptions": {
+                        "options": ["Pois", "Kamera x pää", "Pää x kamera"],
+                        "sourceType": "ModSettingInt"
+                    }
+                },
+                {
+                    "text": "Kierron kompensointi",
+                    "id": "bHeadRotComp:Stereo",
+                    "type": "switcher",
+                    "help": "Kompensoi edellisen kehyksen pään kierron pois kameran asetosta. Kokeile, jos kuva tärisee pään kiertoaessa.",
+                    "valueOptions": {
+                        "sourceType": "ModSettingBool"
+                    }
+                },
+                {
+                    "text": "Pään paikka (6DoF)",
+                    "id": "bHeadPos:Stereo",
+                    "type": "switcher",
+                    "help": "Siirrä HMD:n paikkamuutos pelin kameraan (kumartuminen, nojailu).",
+                    "valueOptions": {
+                        "sourceType": "ModSettingBool"
+                    }
+                },
+                {
+                    "text": "Yksiköitä metriä kohti",
+                    "id": "fUnitsPerMeter:Stereo",
+                    "type": "slider",
+                    "help": "Pelimaailman yksiköiden määrä metriä kohti (paikkasiirron skaalaus). Fallout 4: oletus 70.",
+                    "valueOptions": {
+                        "min": 10.0,
+                        "max": 200.0,
+                        "step": 1.0,
+                        "sourceType": "ModSettingFloat"
+                    }
+                },
+                {
+                    "text": "Silmäetäisyys tähtäimessä",
+                    "id": "fAimIpdScale:Stereo",
+                    "type": "slider",
+                    "help": "Silmän paikka tähdätessä puolen silmäetäisyyden murto-osana: 0 = keskellä (mono, ei kaksoiskuvaa), 1 = oikean silmän paikka, -1 = vasemman silmän paikka. Suuremmat arvot työntävät näkymää kauemmas sivuille.",
+                    "valueOptions": {
+                        "min": -2.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "sourceType": "ModSettingFloat"
+                    }
+                },
+                {
+                    "text": "Konvergenssi (m)",
+                    "id": "fConvergeM:Stereo",
+                    "type": "slider",
+                    "help": "Etäisyys metreinä, jolla silmät osoittavat yhtä pistettä (varjostus/S3D-konvergenssi). 0 = rinnakkaiset silmät.",
+                    "valueOptions": {
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.25,
+                        "sourceType": "ModSettingFloat"
+                    }
+                }
+            ]
+        },
+        {
+            "pageDisplayName": "VR-näkymä",
+            "content": [
+                {
+                    "text": "VR-lähdön asetukset (proxy). Muutokset otetaan käyttöön heti.",
+                    "type": "text"
+                },
+                {
+                    "text": "Silmän viive (eye_delay)",
+                    "id": "bEyeDelay:VR",
+                    "type": "switcher",
+                    "help": "Näytä edellisen kehyksen silmä yhden kehyksen myöhässä. Kokeile, jos silmien kuvat eivät täsmää.",
+                    "valueOptions": {
+                        "sourceType": "ModSettingBool"
+                    }
+                },
+                {
+                    "text": "Vaihda silmät",
+                    "id": "bSwapEyes:VR",
+                    "type": "switcher",
+                    "help": "Vaihda vasen ja oikea silmä keskenään, jos syvyys näkyy väärinpäin.",
+                    "valueOptions": {
+                        "sourceType": "ModSettingBool"
+                    }
+                },
+                {
+                    "text": "Odota positioita",
+                    "id": "bWaitPoses:VR",
+                    "type": "switcher",
+                    "help": "WaitGetPoses ennen kehyksen lähettämistä (alempi viive, pienempi kuvataajuus).",
+                    "valueOptions": {
+                        "sourceType": "ModSettingBool"
+                    }
+                },
+                {
+                    "text": "FSR1-terävöinti",
+                    "id": "fUpSharp:VR",
+                    "type": "slider",
+                    "help": "FSR1-upscalen RCAS-terävöinti: 0 = terävin, isompi = pehmeämpi. Vaatii, että upscale=1 on fo4stereo.ini:ssä (kytkeminen päälle/pois vaatii uudelleenkäynnistyksen).",
+                    "valueOptions": {
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "sourceType": "ModSettingFloat"
+                    }
+                },
+                {
+                    "text": "2D-ruudun leveys (m)",
+                    "id": "fScreenWidth:VR",
+                    "type": "slider",
+                    "help": "Virtuaalisen 2D-ruudun leveys metreinä (valikot, intro, latausruudut).",
+                    "valueOptions": {
+                        "min": 0.5,
+                        "max": 8.0,
+                        "step": 0.1,
+                        "sourceType": "ModSettingFloat"
+                    }
+                },
+                {
+                    "text": "2D-ruudun etäisyys (m)",
+                    "id": "fScreenDist:VR",
+                    "type": "slider",
+                    "help": "Virtuaalisen 2D-ruudun etäisyys metreinä istuvasijainnista.",
+                    "valueOptions": {
+                        "min": 0.3,
+                        "max": 8.0,
+                        "step": 0.1,
+                        "sourceType": "ModSettingFloat"
+                    }
+                },
+                {
+                    "text": "Tähtäysraja (aim_ratio)",
+                    "id": "fAimRatio:VR",
+                    "type": "slider",
+                    "help": "Pelikuvan kaventuma suhteessa kypärän FOV:iin, joka tulkitaan tähtäykseksi (mono-kuva). Suurenna, jos tähtäys laukeaa liian herkästi.",
+                    "valueOptions": {
+                        "min": 0.3,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "sourceType": "ModSettingFloat"
+                    }
+                },
+                {
+                    "text": "Pip-Boy-raja (pipboy_ratio)",
+                    "id": "fPipboyRatio:VR",
+                    "type": "slider",
+                    "help": "Pelikuvan kaventuma, joka tulkitaan Pip-Boyksi (2D-ruutu). Pienempi = vaatii enemmän kaventumaa.",
+                    "valueOptions": {
+                        "min": 0.3,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "sourceType": "ModSettingFloat"
+                    }
+                },
+                {
+                    "text": "Pip-Boyn leveys (m)",
+                    "id": "fPipWidth:VR",
+                    "type": "slider",
+                    "help": "Projisoidun Pip-Boyn leveys metreinä.",
+                    "valueOptions": {
+                        "min": 0.2,
+                        "max": 3.0,
+                        "step": 0.05,
+                        "sourceType": "ModSettingFloat"
+                    }
+                },
+                {
+                    "text": "Pip-Boyn etäisyys (m)",
+                    "id": "fPipDist:VR",
+                    "type": "slider",
+                    "help": "Projisoidun Pip-Boyn etäisyys metreinä.",
+                    "valueOptions": {
+                        "min": 0.5,
+                        "max": 6.0,
+                        "step": 0.1,
+                        "sourceType": "ModSettingFloat"
+                    }
+                }
+            ]
+        }
+    ]
+}

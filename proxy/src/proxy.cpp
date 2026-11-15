@@ -22,7 +22,9 @@
 #include <vector>
 #include "stereo_shm.h"
 #include "openvr.h"
+#include "fsr1_shaders.h"
 #include <shlobj.h>
+#include <d3dcompiler.h>
 
 typedef HRESULT(STDMETHODCALLTYPE* PresentFn)(IDXGISwapChain*, UINT, UINT);
 typedef void(STDMETHODCALLTYPE* VSSetCBFn)(ID3D11DeviceContext*, UINT, UINT, ID3D11Buffer* const*);
@@ -37,6 +39,11 @@ typedef void(STDMETHODCALLTYPE* UpdateSubFn)(ID3D11DeviceContext*, ID3D11Resourc
 typedef void(STDMETHODCALLTYPE* CopySubFn)(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT,
                                            ID3D11Resource*, UINT, const D3D11_BOX*);
 typedef void(STDMETHODCALLTYPE* CopyResFn)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*);
+typedef void(STDMETHODCALLTYPE* OMSetRTFn)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
+                                           ID3D11DepthStencilView*);
+typedef void(STDMETHODCALLTYPE* OMSetRTUavFn)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
+                                              ID3D11DepthStencilView*, UINT, UINT,
+                                              ID3D11UnorderedAccessView* const*, const UINT*);
 
 // ID3D11DeviceContext vtable indices, verified against the Windows SDK d3d11.h
 // (ID3D11DeviceContextVtbl): 0-2 IUnknown, 3-6 ID3D11DeviceChild, then:
@@ -46,6 +53,8 @@ enum CtxIdx : int {
     kDraw = 13,
     kMap = 14,
     kUnmap = 15,
+    kOMSetRenderTargets = 33,
+    kOMSetRenderTargetsAndUAVs = 34,
     kCopySubresourceRegion = 46,
     kCopyResource = 47,
     kUpdateSubresource = 48,
@@ -64,6 +73,8 @@ struct CtxVt {
     CopySubFn copySub;
     CopyResFn copyRes;
     UpdateSubFn updateSub;
+    OMSetRTFn omSetRT;
+    OMSetRTUavFn omSetRTUav;
 };
 static CtxVt g_vts[16];
 static volatile LONG g_nvt = 0;
@@ -657,7 +668,6 @@ static bool g_overlayShown = false;
 static ID3D11Texture2D* g_eyeTex[2] = { nullptr, nullptr };
 static ID3D11Texture2D* g_flatTex = nullptr;
 static ID3D11Texture2D* g_blackTex = nullptr;
-static UINT g_eyeW = 0, g_eyeH = 0;
 static DXGI_FORMAT g_eyeFmt = DXGI_FORMAT_UNKNOWN;
 static StereoShm* g_shm = nullptr;
 static UINT g_vrSubmits = 0, g_vrSubmitErr = 0, g_vrSubmitOk = 0;
@@ -667,6 +677,7 @@ static int g_seqStill = 0;
 static int g_flatPrev = -1;
 static UINT g_poseWrites = 0;
 static bool g_vrUseBounds = true;   // [vr] fov_bounds
+static bool g_monoAim = false;      // first-person aim: both frames are the same image
 static bool g_vrNoVsync = true;     // [vr] no_vsync
 static bool g_vrAutoConfigure = true;  // [vr] auto_configure
 static float g_coverH = 0.0f;          // headset cover tan(half horizontal FOV)
@@ -677,6 +688,54 @@ static bool g_vrOtherCams2D = true;    // [vr] other_cams_2d: VATS, dialogue, 3r
 static LONG g_zoomPrev = -1, g_camStatePrev = -1;
 static unsigned g_vrCamMask = (1u << 0) | (1u << 7);  // [vr] vr_cam_states: states shown in VR (0 first person, 7 third person)
 static int g_boundsLogged = 0;
+// Projected Pip-Boy (as Fallout4VR's bAlwaysUseProjectedPipboy): the game renders the Pip-Boy
+// UI into its own render target (Fallout4Prefs.ini [Display] uPipboyTargetWidth/Height), which
+// is mapped onto the Pip-Boy model's screen. The proxy captures that target at creation and
+// shows it on the 2D screen instead of the zoomed full frame.
+static bool g_vrPipProjected = true;    // [vr] pipboy_projected
+static float g_vrPipWidth = 0.8f;       // [vr] pipboy_screen_width_m
+static float g_vrPipDist = 2.0f;        // [vr] pipboy_screen_distance_m
+static float g_vrPipHeight = -0.35f;    // [vr] pipboy_screen_height_m (relative to eye level)
+static int g_vrPipIndex = 0;            // [vr] pipboy_target_index: which matching target to show
+static UINT g_pipTargetW = 1752, g_pipTargetH = 1400;
+static SRWLOCK g_pipLock = SRWLOCK_INIT;
+static ID3D11Texture2D* g_pipCand[8] = {};
+static int g_pipCandCount = 0;
+static ID3D11Texture2D* g_pipTex = nullptr;   // shareable copy for the overlay
+static ID3D11Texture2D* g_pipTexSrc = nullptr;
+static bool g_overlayIsPip = false;
+static ID3D11RenderTargetView* g_pipRtv[32] = {};
+static int g_pipRtvCand[32] = {};
+static volatile LONG g_pipRtvCount = 0;
+static volatile LONG g_pipDrawnAt = -1000;   // present count when a Pip-Boy target was last bound
+static volatile LONG g_pipDrawnIdx = -1;     // candidate index that was bound
+static volatile LONG g_pipEverDrawn = 0;
+
+// --- FSR1 spatial upscale ([vr] upscale=1) ---
+// Upscales the game backbuffer to the headset's recommended per-eye resolution with
+// AMD FSR1 (EASU + RCAS, non-temporal, no frame history -> safe for the alternate-eye
+// stereo). Eye textures are created at the upscaled size; the per-eye texture-bounds
+// cropping (VrEyeBounds) is in relative UV space, so it stays valid.
+static bool g_vrUpscale = false;        // [vr] upscale
+static float g_vrUpSharp = 0.2f;        // [vr] upscale_sharpness (0 = maximum, N = N stops softer)
+static bool g_upFail = false;           // FSR1 init failed once: fall back to plain copies
+static UINT g_hmdRecW = 0, g_hmdRecH = 0;  // headset recommended per-eye size
+static UINT g_upW = 0, g_upH = 0;          // upscaled size (from bb aspect x recommended)
+static DXGI_FORMAT g_upFmt = DXGI_FORMAT_UNKNOWN;  // eye/mid texture format (UAV-capable)
+static UINT g_bbW = 0, g_bbH = 0, g_bbFmt = 0;     // backbuffer dims of the current textures
+static ID3D11ComputeShader* g_upEasu = nullptr;
+static ID3D11ComputeShader* g_upRcas = nullptr;
+static ID3D11Buffer* g_upCb = nullptr;
+static ID3D11Texture2D* g_upMidA = nullptr;        // EASU output / RCAS input (SRV+UAV)
+static ID3D11ShaderResourceView* g_upMidSrv = nullptr;
+static ID3D11UnorderedAccessView* g_upMidUav = nullptr;
+static ID3D11Texture2D* g_upMidB = nullptr;        // RCAS output, copied into the eye texture
+static ID3D11UnorderedAccessView* g_upMidBUav = nullptr;
+static ID3D11Texture2D* g_upSrc = nullptr;         // copy of the backbuffer (SRV-bindable)
+static ID3D11ShaderResourceView* g_upSrcSrv = nullptr;
+static ID3D11SamplerState* g_upSamp = nullptr;      // linear clamp for the EASU gathers (s0)
+static UINT g_upSrcW = 0, g_upSrcH = 0, g_upSrcF = 0;
+static HWND g_gameHwnd = nullptr;                   // swapchain window, for focus/mouse handling
 
 static void LoadVrConfig() {
     char dir[MAX_PATH];
@@ -721,18 +780,34 @@ static void LoadVrConfig() {
         while (*p == ',' || *p == ' ') ++p;
         if (*p && (*p < '0' || *p > '9')) break;
     }
+    GetPrivateProfileStringA("vr", "pipboy_projected", "1", buf, sizeof(buf), ini.c_str());
+    g_vrPipProjected = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "pipboy_screen_width_m", "0.8", buf, sizeof(buf), ini.c_str());
+    g_vrPipWidth = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "pipboy_screen_distance_m", "2.0", buf, sizeof(buf), ini.c_str());
+    g_vrPipDist = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "pipboy_screen_height_m", "-0.35", buf, sizeof(buf), ini.c_str());
+    g_vrPipHeight = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "pipboy_target_index", "0", buf, sizeof(buf), ini.c_str());
+    g_vrPipIndex = atoi(buf);
+    GetPrivateProfileStringA("vr", "upscale", "0", buf, sizeof(buf), ini.c_str());
+    g_vrUpscale = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "upscale_sharpness", "0.2", buf, sizeof(buf), ini.c_str());
+    g_vrUpSharp = static_cast<float>(atof(buf));
     Log("vr config: enabled=%d eye_delay=%d swap_eyes=%d wait_poses=%d flat_after=%d screen=%.2fm@%.2fm",
         g_vrEnabled ? 1 : 0, g_vrEyeDelay, g_vrSwap ? 1 : 0, g_vrWaitPoses ? 1 : 0, g_vrFlatAfter,
         g_vrOverlayWidth, g_vrOverlayDist);
+    Log("vr config: upscale=%d sharpness=%.2f", g_vrUpscale ? 1 : 0, g_vrUpSharp);
 }
 
-static void VrPlaceOverlay() {
+static void VrPlaceOverlay(bool pip = false) {
     if (!g_vrOverlay || g_overlay == vr::k_ulOverlayHandleInvalid) return;
     vr::HmdMatrix34_t m = {};
     m.m[0][0] = 1.0f; m.m[1][1] = 1.0f; m.m[2][2] = 1.0f;
-    m.m[2][3] = -g_vrOverlayDist;  // seated space: -z is forward from the seated zero pose
+    m.m[1][3] = pip ? g_vrPipHeight : 0.0f;
+    m.m[2][3] = -(pip ? g_vrPipDist : g_vrOverlayDist);  // seated space: -z is forward from the seated zero pose
     g_vrOverlay->SetOverlayTransformAbsolute(g_overlay, vr::TrackingUniverseSeated, &m);
-    g_vrOverlay->SetOverlayWidthInMeters(g_overlay, g_vrOverlayWidth);
+    g_vrOverlay->SetOverlayWidthInMeters(g_overlay, pip ? g_vrPipWidth : g_vrOverlayWidth);
 }
 
 
@@ -757,6 +832,29 @@ static std::string DocumentsFallout4Dir() {
     }
     if (docs) CoTaskMemFree(docs);
     return out;
+}
+
+// Pip-Boy render target size from Fallout4Prefs.ini [Display] (game default 1752x1400).
+static void LoadPipboyTargetSize() {
+    const std::string dir = DocumentsFallout4Dir();
+    if (dir.empty()) return;
+    const std::string prefs = dir + "Fallout4Prefs.ini";
+    const UINT w = GetPrivateProfileIntA("Display", "uPipboyTargetWidth", 1752, prefs.c_str());
+    const UINT h = GetPrivateProfileIntA("Display", "uPipboyTargetHeight", 1400, prefs.c_str());
+    if (w > 0 && h > 0) { g_pipTargetW = w; g_pipTargetH = h; }
+    Log("vr: pipboy target size %ux%u (projected=%d, screen %.2fm, index %d)", g_pipTargetW, g_pipTargetH,
+        g_vrPipProjected ? 1 : 0, g_vrPipWidth, g_vrPipIndex);
+}
+
+static DXGI_FORMAT TypedFormat(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default: return f;
+    }
 }
 
 static bool IniSetIfDifferent(const std::string& file, const char* section, const char* key, const char* value) {
@@ -822,6 +920,8 @@ static void VrQueryHmdView(VRGetIfaceFn getIface) {
     if (!sys || err != vr::VRInitError_None) { Log("vr: IVRSystem unavailable err=%d", (int)err); return; }
     uint32_t rw = 0, rh = 0;
     sys->GetRecommendedRenderTargetSize(&rw, &rh);
+    g_hmdRecW = static_cast<UINT>(rw);
+    g_hmdRecH = static_cast<UINT>(rh);
     for (int e = 0; e < 2; ++e) {
         sys->GetProjectionRaw(e == 0 ? vr::Eye_Left : vr::Eye_Right,
                               &g_eyeTan[e][0], &g_eyeTan[e][1], &g_eyeTan[e][2], &g_eyeTan[e][3]);
@@ -870,10 +970,23 @@ static bool VrEyeBounds(int eye, vr::VRTextureBounds_t& b) {
     if (!g_haveEyeTan || gx <= 0.0f || gy <= 0.0f) return false;
     auto clamp01 = [](float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); };
     const float* t = g_eyeTan[eye];
-    b.uMin = clamp01((t[0] + gx) / (2.0f * gx));
-    b.uMax = clamp01((t[1] + gx) / (2.0f * gx));
-    b.vMin = clamp01((t[2] + gy) / (2.0f * gy));
-    b.vMax = clamp01((t[3] + gy) / (2.0f * gy));
+    float tl = t[0], tr = t[1], tb = t[2], tt = t[3];
+    if (g_monoAim) {
+        // Mono aim: the plugin renders BOTH frames from the same (signed) eye
+        // offset, so both eyes must show the SAME window. The per-eye crops
+        // differ by ~18% horizontally, which split the one image into two
+        // shifted copies - the "missing barrel tip" on the left copy.
+        // Collapse to the head-centred average of the two windows.
+        const float* o = g_eyeTan[1 - eye];
+        tl = 0.5f * (t[0] + o[0]);
+        tr = 0.5f * (t[1] + o[1]);
+        tb = 0.5f * (t[2] + o[2]);
+        tt = 0.5f * (t[3] + o[3]);
+    }
+    b.uMin = clamp01((tl + gx) / (2.0f * gx));
+    b.uMax = clamp01((tr + gx) / (2.0f * gx));
+    b.vMin = clamp01((tb + gy) / (2.0f * gy));
+    b.vMax = clamp01((tt + gy) / (2.0f * gy));
     return b.uMax > b.uMin && b.vMax > b.vMin;
 }
 
@@ -881,6 +994,62 @@ static UINT g_vrInitAttempts = 0;
 static ULONGLONG g_vrNextTryMs = 0;
 
 // Retries every 10 s until SteamVR has a headset, so the HMD can be connected after the game started.
+// --- MCM live settings ------------------------------------------------------
+// The MCM core writes user settings to <game>\Data\MCM\Settings\F4Flat2VR.ini
+// (same file the F4SE plugin watches). Read it directly here as well: it is the
+// reliable path into the proxy and does not depend on the plugin being present.
+// Gate on the file's last-write time; apply only on change.
+static void VrApplyMcm()
+{
+    static char s_path[MAX_PATH] = "";
+    static FILETIME s_write{};
+    static bool s_have = false;
+    if (!s_path[0]) {
+        char dir[MAX_PATH];
+        GetModuleFileNameA(nullptr, dir, MAX_PATH);
+        char* slash = strrchr(dir, '\\');
+        if (slash) *(slash + 1) = '\0';
+        snprintf(s_path, MAX_PATH, "%sData\\MCM\\Settings\\F4Flat2VR.ini", dir);
+    }
+    WIN32_FILE_ATTRIBUTE_DATA d{};
+    if (!GetFileAttributesExA(s_path, GetFileExInfoStandard, &d)) return;
+    if (s_have && d.ftLastWriteTime.dwLowDateTime == s_write.dwLowDateTime &&
+        d.ftLastWriteTime.dwHighDateTime == s_write.dwHighDateTime) return;
+    s_have = true;
+    s_write = d.ftLastWriteTime;
+
+    auto readF = [&](const char* key, float cur, float lo, float hi) {
+        char buf[64]{};
+        char def[32];
+        snprintf(def, sizeof(def), "%.5f", static_cast<double>(cur));
+        GetPrivateProfileStringA("VR", key, def, buf, sizeof(buf), s_path);
+        const float v = static_cast<float>(atof(buf));
+        return (v >= lo && v <= hi) ? v : cur;
+    };
+    auto readI = [&](const char* key, int cur, int lo, int hi) {
+        char buf[64]{};
+        char def[32];
+        snprintf(def, sizeof(def), "%d", cur);
+        GetPrivateProfileStringA("VR", key, def, buf, sizeof(buf), s_path);
+        const int v = atoi(buf);
+        return (v >= lo && v <= hi) ? v : cur;
+    };
+
+    g_vrEyeDelay = readI("bEyeDelay", g_vrEyeDelay, 0, 1);
+    g_vrSwap = readI("bSwapEyes", g_vrSwap ? 1 : 0, 0, 1) != 0;
+    g_vrWaitPoses = readI("bWaitPoses", g_vrWaitPoses ? 1 : 0, 0, 1) != 0;
+    g_vrAimRatio = readF("fAimRatio", g_vrAimRatio, 0.1f, 1.0f);
+    g_vrPipboyRatio = readF("fPipboyRatio", g_vrPipboyRatio, 0.1f, 1.0f);
+    g_vrOverlayWidth = readF("fScreenWidth", g_vrOverlayWidth, 0.1f, 20.0f);
+    g_vrOverlayDist = readF("fScreenDist", g_vrOverlayDist, 0.1f, 20.0f);
+    g_vrPipWidth = readF("fPipWidth", g_vrPipWidth, 0.1f, 10.0f);
+    g_vrPipDist = readF("fPipDist", g_vrPipDist, 0.1f, 10.0f);
+    g_vrUpSharp = readF("fUpSharp", g_vrUpSharp, 0.0f, 2.0f);
+    Log("vr mcm: eyeDelay=%d swap=%d waitPoses=%d sharp=%.2f ratios %.2f/%.2f screen %.1fm@%.1fm pip %.1fm@%.1fm",
+        g_vrEyeDelay, g_vrSwap ? 1 : 0, g_vrWaitPoses ? 1 : 0, g_vrUpSharp, g_vrAimRatio, g_vrPipboyRatio,
+        g_vrOverlayWidth, g_vrOverlayDist, g_vrPipWidth, g_vrPipDist);
+}
+
 static void VrInitOnce() {
     if (!g_vrTried) {
         g_vrTried = true;
@@ -943,13 +1112,43 @@ static bool CreateFrameTexture(const D3D11_TEXTURE2D_DESC& e, const void* init, 
     return SUCCEEDED(g_dev->CreateTexture2D(&e, init ? &sd : nullptr, out));
 }
 
+static void VrUpscaleInit();  // defined below; compiles the FSR1 compute shaders
+
 static void VrEnsureTextures(ID3D11Texture2D* bb) {
     D3D11_TEXTURE2D_DESC d = {};
     bb->GetDesc(&d);
-    if (g_eyeTex[0] && d.Width == g_eyeW && d.Height == g_eyeH && d.Format == g_eyeFmt) return;
+    // [vr] upscale=1: eye textures get the headset's recommended per-eye size at the
+    // backbuffer's aspect (uniform scale, capped at 4x). The game keeps rendering at the
+    // window size; FSR1 upscales before the per-eye copy (see VrUpscale).
+    UINT upW = 0, upH = 0;
+    DXGI_FORMAT upFmt = d.Format;
+    if (g_vrUpscale && g_hmdRecW && g_hmdRecH && !g_upFail) {
+        VrUpscaleInit();  // compile the FSR1 shaders once, before sizing the eye textures
+    }
+    if (g_vrUpscale && g_hmdRecW && g_hmdRecH && !g_upFail) {
+        const float s = (std::min)(4.0f, (std::max)(
+            static_cast<float>(g_hmdRecW) / static_cast<float>(d.Width),
+            static_cast<float>(g_hmdRecH) / static_cast<float>(d.Height)));
+        upW = (std::max)(d.Width, static_cast<UINT>(d.Width * s + 0.5f));
+        upH = (std::max)(d.Height, static_cast<UINT>(d.Height * s + 0.5f));
+        UINT sup = 0;
+        if (FAILED(g_dev->CheckFormatSupport(d.Format, &sup))
+                || !(sup & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW)) {
+            upFmt = DXGI_FORMAT_R8G8B8A8_UNORM;  // UAV-capable everywhere; compositor handles it
+            Log("vr: upscale: fmt %d lacks UAV, using R8G8B8A8", (int)d.Format);
+        }
+    }
+    if (g_eyeTex[0] && d.Width == g_bbW && d.Height == g_bbH && d.Format == g_bbFmt
+            && upW == g_upW && upH == g_upH && upFmt == g_upFmt
+            && !(g_upFail && g_upW)) return;
     for (auto& t : g_eyeTex) { if (t) { t->Release(); t = nullptr; } }
     if (g_flatTex) { g_flatTex->Release(); g_flatTex = nullptr; }
     if (g_blackTex) { g_blackTex->Release(); g_blackTex = nullptr; }
+    if (g_upMidA) { g_upMidA->Release(); g_upMidA = nullptr; }
+    if (g_upMidSrv) { g_upMidSrv->Release(); g_upMidSrv = nullptr; }
+    if (g_upMidUav) { g_upMidUav->Release(); g_upMidUav = nullptr; }
+    if (g_upMidB) { g_upMidB->Release(); g_upMidB = nullptr; }
+    if (g_upMidBUav) { g_upMidBUav->Release(); g_upMidBUav = nullptr; }
     D3D11_TEXTURE2D_DESC e = d;
     e.MipLevels = 1;
     e.ArraySize = 1;
@@ -960,15 +1159,44 @@ static void VrEnsureTextures(ID3D11Texture2D* bb) {
     e.CPUAccessFlags = 0;
     // Shareable so the SteamVR compositor can open it (error 106 SharedTexturesNotSupported otherwise).
     e.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    if (upW) { e.Width = upW; e.Height = upH; e.Format = upFmt; }
     for (auto& t : g_eyeTex) {
         if (!CreateFrameTexture(e, nullptr, 0, &t)) { Log("vr: eye texture create failed"); return; }
     }
+    // The 2D-screen overlay texture keeps the backbuffer's size (not upscaled).
+    if (upW) {
+        e.Width = d.Width; e.Height = d.Height; e.Format = d.Format;
+    }
     if (!CreateFrameTexture(e, nullptr, 0, &g_flatTex)) Log("vr: flat texture create failed");
     // Black frame for both eyes while the 2D screen is shown (4 bytes per pixel formats).
-    std::vector<uint8_t> zeros(static_cast<size_t>(d.Width) * d.Height * 4, 0);
-    if (!CreateFrameTexture(e, zeros.data(), d.Width * 4, &g_blackTex)) Log("vr: black texture create failed");
-    g_eyeW = d.Width; g_eyeH = d.Height; g_eyeFmt = d.Format;
-    Log("vr: eye textures %ux%u fmt=%d samples=%u", d.Width, d.Height, (int)d.Format, d.SampleDesc.Count);
+    if (upW) {
+        e.Width = upW; e.Height = upH; e.Format = upFmt;
+    }
+    std::vector<uint8_t> zeros(static_cast<size_t>(e.Width) * e.Height * 4, 0);
+    if (!CreateFrameTexture(e, zeros.data(), e.Width * 4, &g_blackTex)) Log("vr: black texture create failed");
+    // Intermediate textures for the FSR1 passes (not shared; UAV+SRV allowed here).
+    if (upW) {
+        e.MiscFlags = 0;
+        e.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        if (!CreateFrameTexture(e, nullptr, 0, &g_upMidA)) { Log("vr: upscale: midA create failed"); }
+        if (g_upMidA) {
+            if (FAILED(g_dev->CreateShaderResourceView(g_upMidA, nullptr, &g_upMidSrv))
+                    || FAILED(g_dev->CreateUnorderedAccessView(g_upMidA, nullptr, &g_upMidUav))) {
+                Log("vr: upscale: midA view create failed");
+            }
+        }
+        e.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        if (!CreateFrameTexture(e, nullptr, 0, &g_upMidB)) { Log("vr: upscale: midB create failed"); }
+        if (g_upMidB && FAILED(g_dev->CreateUnorderedAccessView(g_upMidB, nullptr, &g_upMidBUav))) {
+            Log("vr: upscale: midB view create failed");
+        }
+        e.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        e.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    }
+    g_upW = upW; g_upH = upH; g_upFmt = upFmt;
+    g_bbW = d.Width; g_bbH = d.Height; g_bbFmt = d.Format; g_eyeFmt = d.Format;
+    Log("vr: eye textures %ux%u fmt=%d samples=%u (bb %ux%u fmt %d, upscale %u)", e.Width, e.Height,
+        (int)e.Format, 1u, d.Width, d.Height, (int)d.Format, upW ? 1u : 0u);
 }
 
 // HMD pose (seated space) -> shared memory, for the plugin's head tracking.
@@ -1015,9 +1243,455 @@ static void VrWritePose(const vr::TrackedDevicePose_t& p) {
     }
 }
 
+// Copies the captured Pip-Boy render target into a shareable texture. Returns it, or nullptr.
+static ID3D11Texture2D* VrPipboyTexture() {
+    ID3D11Texture2D* src = nullptr;
+    int count = 0;
+    AcquireSRWLockShared(&g_pipLock);
+    count = g_pipCandCount;
+    if (count > 0) {
+        // Prefer the target the game actually drew into; else [vr] pipboy_target_index.
+        const LONG drawn = g_pipDrawnIdx;
+        const int want = drawn >= 0 ? static_cast<int>(drawn) : g_vrPipIndex;
+        const int idx = want < 0 ? 0 : (want >= count ? count - 1 : want);
+        src = g_pipCand[idx];
+        src->AddRef();
+    }
+    ReleaseSRWLockShared(&g_pipLock);
+    if (!src) return nullptr;
+    D3D11_TEXTURE2D_DESC d = {};
+    src->GetDesc(&d);
+    const DXGI_FORMAT fmt = TypedFormat(d.Format);
+    if (src != g_pipTexSrc || !g_pipTex) {
+        if (g_pipTex) { g_pipTex->Release(); g_pipTex = nullptr; }
+        D3D11_TEXTURE2D_DESC e = {};
+        e.Width = d.Width; e.Height = d.Height; e.MipLevels = 1; e.ArraySize = 1;
+        e.Format = fmt; e.SampleDesc.Count = 1; e.Usage = D3D11_USAGE_DEFAULT;
+        e.BindFlags = D3D11_BIND_SHADER_RESOURCE; e.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        if (!CreateFrameTexture(e, nullptr, 0, &g_pipTex)) {
+            Log("vr: pipboy copy texture create failed (fmt %d)", (int)fmt);
+            g_pipTex = nullptr;
+        }
+        g_pipTexSrc = src;
+        Log("vr: pipboy overlay from target %p (%d candidates) %ux%u fmt=%d mips=%u samples=%u",
+            (void*)src, count, d.Width, d.Height, (int)d.Format, d.MipLevels, d.SampleDesc.Count);
+    }
+    if (g_pipTex) {
+        if (d.SampleDesc.Count > 1) g_ctx->ResolveSubresource(g_pipTex, 0, src, 0, fmt);
+        else g_ctx->CopySubresourceRegion(g_pipTex, 0, 0, 0, 0, src, 0, nullptr);
+    }
+    src->Release();
+    return g_pipTex;
+}
+
+// --- FSR1 upscale (AMD FidelityFX Super Resolution 1, MIT) ---
+// EASU: backbuffer -> g_upMid (12-tap edge-aware scaling). RCAS: g_upMid -> eye texture
+// (sharpen). The eye texture is the SteamVR-shared texture, so the final RCAS result is
+// copied into it with CopyResource (shared textures must not carry a UAV bind flag).
+struct FsrCb {
+    UINT c0[4], c1[4], c2[4], c3[4], rcas[4], misc[4];  // matches cbUpscale in fsr1_main.hlsl (96 bytes)
+};
+static_assert(sizeof(FsrCb) == 96, "cbUpscale layout");
+
+static UINT FsrBits(float f) { UINT u; memcpy(&u, &f, 4); return u; }
+
+// Debug: reads one pixel back from a GPU texture and logs it. Staging copy forces a
+// GPU sync, so this is only used for the first few frames while bring-up debugging.
+static void LogUpPx(const char* tag, ID3D11Texture2D* src, UINT x, UINT y) {
+    if (!g_dev || !g_ctx || !src) return;
+    D3D11_TEXTURE2D_DESC d = {};
+    src->GetDesc(&d);
+    if (x >= d.Width) x = d.Width / 2;
+    if (y >= d.Height) y = d.Height / 2;
+    D3D11_TEXTURE2D_DESC s = d;
+    s.Width = 1; s.Height = 1; s.MipLevels = 1; s.ArraySize = 1;
+    s.SampleDesc.Count = 1; s.SampleDesc.Quality = 0;
+    s.Usage = D3D11_USAGE_STAGING; s.BindFlags = 0;
+    s.CPUAccessFlags = D3D11_CPU_ACCESS_READ; s.MiscFlags = 0;
+    ID3D11Texture2D* st = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&s, nullptr, &st)) || !st) return;
+    D3D11_BOX box = { x, y, 0, x + 1, y + 1, 1 };
+    g_ctx->CopySubresourceRegion(st, 0, 0, 0, 0, src, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (SUCCEEDED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+        const unsigned char* p = static_cast<const unsigned char*>(m.pData);
+        Log("vr: upscale px %s (%u,%u) = %02x %02x %02x %02x", tag, x, y, p[0], p[1], p[2], p[3]);
+        g_ctx->Unmap(st, 0);
+    } else {
+        Log("vr: upscale px %s map failed", tag);
+    }
+    st->Release();
+}
+
+// FsrEasuCon() from ffx_fsr1.h (CPU section), transcribed to plain C++ so the proxy does
+// not need to include the whole CPU half of ffx_a.h. Bit-exact to the original.
+static void FsrEasuConFill(UINT* c, float inX, float inY, float resX, float resY) {
+    const float rX = 1.0f / resX, rY = 1.0f / resY;
+    c[0]  = FsrBits(inX * rX);
+    c[1]  = FsrBits(inY * rY);
+    c[2]  = FsrBits(0.5f * inX * rX - 0.5f);
+    c[3]  = FsrBits(0.5f * inY * rY - 0.5f);
+    c[4]  = FsrBits(1.0f / inX);
+    c[5]  = FsrBits(1.0f / inY);
+    c[6]  = FsrBits(1.0f / inX);
+    c[7]  = FsrBits(-1.0f / inY);
+    c[8]  = FsrBits(-1.0f / inX);
+    c[9]  = FsrBits(2.0f / inY);
+    c[10] = FsrBits(1.0f / inX);
+    c[11] = FsrBits(2.0f / inY);
+    c[12] = FsrBits(0.0f);
+    c[13] = FsrBits(4.0f / inY);
+    c[14] = c[15] = 0;
+}
+
+static void VrUpscaleInit() {
+    if (!g_dev || g_upEasu || g_upFail) return;
+    UINT sup = 0;
+    if (FAILED(g_dev->CheckFormatSupport(DXGI_FORMAT_B8G8R8A8_UNORM, &sup))) sup = 0;
+    if (!(sup & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW)) {
+        Log("vr: upscale: device lacks BGRA UAV support (fmt support %x)", sup);
+        g_upFail = true;
+        return;
+    }
+    // Join the embedded source lines once (each line is its own literal because this
+    // MSVC rejects string literals over ~16.4 KB, C2026).
+    static std::string src;
+    static bool srcReady = false;
+    if (!srcReady) {
+        srcReady = true;
+        for (UINT i = 0; i < g_fsr1PartCount; ++i) { src += g_fsr1Parts[i]; src += '\n'; }
+    }
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* err = nullptr;
+    for (int pass = 0; pass < 2; ++pass) {
+        const char* fn = pass == 0 ? "CsEasu" : "CsRcas";
+        if (FAILED(D3DCompile(src.data(), src.size(), "fsr1", nullptr, nullptr, fn, "cs_5_0",
+                              0, 0, &blob, &err))) {
+            Log("vr: upscale: %s compile failed: %s", fn,
+                err && err->GetBufferPointer() ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+            if (err) err->Release();
+            err = nullptr;
+            g_upFail = true;
+            return;
+        }
+        HRESULT hr = pass == 0 ? g_dev->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                           nullptr, &g_upEasu)
+                               : g_dev->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                            nullptr, &g_upRcas);
+        blob->Release();
+        blob = nullptr;
+        if (FAILED(hr)) { Log("vr: upscale: %s create failed hr=%x", fn, (unsigned)hr); g_upFail = true; return; }
+    }
+    if (err) err->Release();
+    D3D11_BUFFER_DESC cb = {};
+    cb.ByteWidth = sizeof(FsrCb);
+    cb.Usage = D3D11_USAGE_DYNAMIC;
+    cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g_dev->CreateBuffer(&cb, nullptr, &g_upCb))) {
+        Log("vr: upscale: cb create failed");
+        g_upFail = true;
+        return;
+    }
+    // EASU gathers through s0; an unbound sampler slot gives undefined (black) results.
+    D3D11_SAMPLER_DESC smp = {};
+    smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    smp.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(g_dev->CreateSamplerState(&smp, &g_upSamp))) {
+        Log("vr: upscale: sampler create failed");
+        g_upFail = true;
+        return;
+    }
+    Log("vr: upscale: FSR1 shaders compiled (sharpness %.2f)", g_vrUpSharp);
+}
+
+// Runs EASU+RCAS and copies the result into dst (an eye texture). Returns false when the
+// upscale path is not available (caller then falls back to a plain copy/resolve).
+static bool VrUpscale(ID3D11Texture2D* bb, ID3D11Texture2D* dst) {
+    // Without the mid textures the caller's plain-copy fallback cannot work either
+    // (the eye texture is larger than the backbuffer, CopyResource silently no-ops),
+    // so disable the oversized eye textures for this session.
+    if (!g_upW || !g_upH || !g_upMidUav || !g_upMidBUav) { g_upFail = true; return false; }
+    VrUpscaleInit();
+    if (!g_upEasu || !g_upRcas || !g_upCb || !g_upMidSrv) { g_upFail = true; return false; }
+
+    D3D11_TEXTURE2D_DESC d = {};
+    bb->GetDesc(&d);
+    // The swapchain backbuffer carries no D3D11_BIND_SHADER_RESOURCE flag, so a view on
+    // it cannot be created; copy it into our own SRV-bindable texture first.
+    if (g_upSrcW != d.Width || g_upSrcH != d.Height || g_upSrcF != d.Format) {
+        if (g_upSrc) { g_upSrc->Release(); g_upSrc = nullptr; }
+        if (g_upSrcSrv) { g_upSrcSrv->Release(); g_upSrcSrv = nullptr; }
+        D3D11_TEXTURE2D_DESC s = d;
+        s.MipLevels = 1;
+        s.ArraySize = 1;
+        s.SampleDesc.Count = 1;
+        s.SampleDesc.Quality = 0;
+        s.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        s.MiscFlags = 0;
+        if (!CreateFrameTexture(s, nullptr, 0, &g_upSrc)
+                || FAILED(g_dev->CreateShaderResourceView(g_upSrc, nullptr, &g_upSrcSrv))) {
+            Log("vr: upscale: src texture/SRV create failed");
+            g_upFail = true;
+            return false;
+        }
+        g_upSrcW = d.Width; g_upSrcH = d.Height; g_upSrcF = d.Format;
+    }
+    if (d.SampleDesc.Count > 1) g_ctx->ResolveSubresource(g_upSrc, 0, bb, 0, d.Format);
+    else g_ctx->CopyResource(g_upSrc, bb);
+    ID3D11ShaderResourceView* srcSrv = g_upSrcSrv;
+    srcSrv->AddRef();
+
+    // Constants: EASU in pass 1, RCAS in pass 2; output size gates the dispatch bounds.
+    FsrCb cb = {};
+    FsrEasuConFill(cb.c0, static_cast<float>(d.Width), static_cast<float>(d.Height),
+                   static_cast<float>(g_upW), static_cast<float>(g_upH));
+    cb.rcas[0] = FsrBits(exp2f(-g_vrUpSharp));
+    cb.misc[0] = g_upW;
+    cb.misc[1] = g_upH;
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (SUCCEEDED(g_ctx->Map(g_upCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, &cb, sizeof(cb));
+        g_ctx->Unmap(g_upCb, 0);
+    } else {
+        srcSrv->Release();
+        Log("vr: upscale: cb map failed");
+        g_upFail = true;
+        return false;
+    }
+
+    // 8x8 tiles: a 1D layout needs (W*H+63)/64 groups in X, which at 2432x2524 is
+    // 95912 > 65535 (D3D11 max thread groups per dimension) and the dispatch is
+    // silently dropped, leaving the output black.
+    const UINT gx = (g_upW + 7) / 8, gy = (g_upH + 7) / 8;
+    ID3D11UnorderedAccessView* midUav = g_upMidUav;
+    ID3D11Buffer* cbp = g_upCb;
+    ID3D11SamplerState* smp = g_upSamp;
+    g_ctx->CSSetSamplers(0, 1, smp ? &smp : nullptr);
+    g_ctx->CSSetShader(g_upEasu, nullptr, 0);
+    g_ctx->CSSetConstantBuffers(0, 1, &cbp);
+    g_ctx->CSSetShaderResources(0, 1, &srcSrv);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &midUav, nullptr);
+    g_ctx->Dispatch(gx, gy, 1);
+
+    ID3D11ShaderResourceView* midSrv = g_upMidSrv;
+    ID3D11UnorderedAccessView* midBUav = g_upMidBUav;
+    // Unbind midA from u0 BEFORE binding it as t0: D3D11 drops an SRV bind that
+    // conflicts with an already-bound UAV, which left t0 null and zeroed every
+    // RCAS load (EASU output lost -> black eye texture).
+    ID3D11UnorderedAccessView* nullUav = nullptr;
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+    g_ctx->CSSetShader(g_upRcas, nullptr, 0);
+    g_ctx->CSSetShaderResources(0, 1, &midSrv);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &midBUav, nullptr);
+    g_ctx->Dispatch(gx, gy, 1);
+
+    ID3D11ShaderResourceView* nsrv = nullptr;
+    ID3D11UnorderedAccessView* nuav = nullptr;
+    ID3D11SamplerState* nsmp = nullptr;
+    g_ctx->CSSetShaderResources(0, 1, &nsrv);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &nuav, nullptr);
+    g_ctx->CSSetSamplers(0, 1, &nsmp);
+    g_ctx->CSSetShader(nullptr, nullptr, 0);
+    g_ctx->CopyResource(dst, g_upMidB);
+    srcSrv->Release();
+    // Bring-up debug: track where the image turns black (src=EASU input, easu/rcas=pass
+    // outputs, eye=what SteamVR gets). First 3 calls only; staging copies sync the GPU.
+    static int s_pxDbg = 0;
+    if (s_pxDbg < 3) {
+        ++s_pxDbg;
+        Log("vr: upscale px debug frame %d (bb %ux%u -> eye %ux%u)", s_pxDbg, g_upSrcW, g_upSrcH, g_upW, g_upH);
+        LogUpPx("src ", g_upSrc, g_upSrcW / 4, g_upSrcH / 4);
+        LogUpPx("src ", g_upSrc, g_upSrcW / 2, g_upSrcH / 2);
+        LogUpPx("easu", g_upMidA, g_upW / 4, g_upH / 4);
+        LogUpPx("easu", g_upMidA, g_upW / 2, g_upH / 2);
+        LogUpPx("rcas", g_upMidB, g_upW / 4, g_upH / 4);
+        LogUpPx("rcas", g_upMidB, g_upW / 2, g_upH / 2);
+        LogUpPx("eye ", dst, g_upW / 4, g_upH / 4);
+        LogUpPx("eye ", dst, g_upW / 2, g_upH / 2);
+    }
+    return true;
+}
+
 // Called from Present before the original Present.
+// --- software cursor for the 2D screen ---------------------------------------
+// Fallout 4 draws menu pointers with the OS hardware cursor, which never lands in
+// the UI render target, so the headset screen shows no pointer even though the
+// game receives the mouse. Composite an arrow at the mouse position into the
+// overlay texture (read-modify-write of a small rect; menus only).
+static const UINT kCurW = 14, kCurH = 21;
+static ID3D11Texture2D* g_curTex = nullptr;   // arrow sprite (GPU)
+static ID3D11Texture2D* g_curStg = nullptr;   // staging scratch for the composite
+static unsigned char g_curPx[kCurW * kCurH * 4];
+static POINT g_curLastPos{};
+static ULONGLONG g_curLastMoveMs = 0;
+
+static void MakeCursorSprite() {
+    if (g_curTex || !g_dev) return;
+    // Classic arrow polygon: black outline, white fill.
+    static const float px[7] = { 0.0f, 0.0f, 4.0f, 7.0f, 9.0f, 6.0f, 11.0f };
+    static const float py[7] = { 0.0f, 16.0f, 12.0f, 19.0f, 18.0f, 11.0f, 11.0f };
+    auto inside = [](float x, float y) {
+        bool in = false;
+        for (int i = 0, j = 6; i < 7; j = i++) {
+            if ((py[i] > y) != (py[j] > y) &&
+                x < (px[j] - px[i]) * (y - py[i]) / (py[j] - py[i]) + px[i]) {
+                in = !in;
+            }
+        }
+        return in;
+    };
+    auto edgeDist = [](float x, float y) {
+        float best = 1e9f;
+        for (int i = 0, j = 6; i < 7; j = i++) {
+            const float dx = px[j] - px[i], dy = py[j] - py[i];
+            float t = ((x - px[i]) * dx + (y - py[i]) * dy) / (dx * dx + dy * dy);
+            if (t < 0.0f) t = 0.0f;
+            else if (t > 1.0f) t = 1.0f;
+            const float ex = px[i] + t * dx - x, ey = py[i] + t * dy - y;
+            const float d = std::sqrt(ex * ex + ey * ey);
+            if (d < best) best = d;
+        }
+        return best;
+    };
+    memset(g_curPx, 0, sizeof(g_curPx));
+    for (UINT y = 0; y < kCurH; ++y) {
+        for (UINT x = 0; x < kCurW; ++x) {
+            const float fx = static_cast<float>(x) + 0.5f, fy = static_cast<float>(y) + 0.5f;
+            unsigned char* p = &g_curPx[(y * kCurW + x) * 4];
+            if (inside(fx, fy)) {
+                p[0] = p[1] = p[2] = 255;
+                p[3] = 255;
+            } else if (edgeDist(fx, fy) < 1.1f) {
+                p[3] = 255;  // outline (black)
+            }
+        }
+    }
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = kCurW;
+    d.Height = kCurH;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd{};
+    sd.pSysMem = g_curPx;
+    sd.SysMemPitch = kCurW * 4;
+    if (FAILED(g_dev->CreateTexture2D(&d, &sd, &g_curTex))) g_curTex = nullptr;
+}
+
+static void DrawOverlayCursor(ID3D11Texture2D* dst) {
+    if (!dst || !g_dev || !g_ctx || !g_gameHwnd) return;
+    MakeCursorSprite();
+    if (!g_curTex) return;
+    POINT p{};
+    RECT rc{};
+    if (!GetCursorPos(&p) || !ScreenToClient(g_gameHwnd, &p) ||
+            !GetClientRect(g_gameHwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) {
+        return;
+    }
+    if (p.x != g_curLastPos.x || p.y != g_curLastPos.y) {
+        g_curLastPos = p;
+        g_curLastMoveMs = GetTickCount64();
+    } else if (GetTickCount64() - g_curLastMoveMs > 5000) {
+        return;  // idle: hide the pointer
+    }
+    if (p.x < 0 || p.y < 0 || p.x >= rc.right || p.y >= rc.bottom) return;
+    D3D11_TEXTURE2D_DESC td{};
+    dst->GetDesc(&td);
+    // The target is shown letterboxed/pillarboxed in the window (aspect kept,
+    // centred) and the game hit-tests with that same mapping; mapping proportionally
+    // over the whole window made the drawn cursor sit ~10% above the game's pointer.
+    const double ta = static_cast<double>(td.Width) / static_cast<double>(td.Height);
+    const double wa = static_cast<double>(rc.right) / static_cast<double>(rc.bottom);
+    double sc, ox, oy;
+    if (wa > ta) {  // window wider: fit height, pillarbox left/right
+        sc = static_cast<double>(rc.bottom) / static_cast<double>(td.Height);
+        ox = (static_cast<double>(rc.right) - static_cast<double>(td.Width) * sc) * 0.5;
+        oy = 0.0;
+    } else {  // window taller: fit width, letterbox top/bottom
+        sc = static_cast<double>(rc.right) / static_cast<double>(td.Width);
+        ox = 0.0;
+        oy = (static_cast<double>(rc.bottom) - static_cast<double>(td.Height) * sc) * 0.5;
+    }
+    const int x0 = static_cast<int>(((static_cast<double>(p.x) - ox) / sc));
+    const int y0 = static_cast<int>(((static_cast<double>(p.y) - oy) / sc));
+    if (x0 < 0 || y0 < 0 || x0 >= static_cast<int>(td.Width) || y0 >= static_cast<int>(td.Height)) return;
+    UINT w = kCurW, h = kCurH;
+    if (x0 + static_cast<int>(w) > static_cast<int>(td.Width)) w = td.Width - static_cast<UINT>(x0);
+    if (y0 + static_cast<int>(h) > static_cast<int>(td.Height)) h = td.Height - static_cast<UINT>(y0);
+    if (w == 0 || h == 0) return;
+    if (!g_curStg) {
+        D3D11_TEXTURE2D_DESC s{};
+        s.Width = kCurW;
+        s.Height = kCurH;
+        s.MipLevels = 1;
+        s.ArraySize = 1;
+        s.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        s.SampleDesc.Count = 1;
+        s.Usage = D3D11_USAGE_STAGING;
+        s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(g_dev->CreateTexture2D(&s, nullptr, &g_curStg))) g_curStg = nullptr;
+    }
+    if (!g_curStg) return;
+    const D3D11_BOX box{ static_cast<UINT>(x0), static_cast<UINT>(y0), 0,
+                         static_cast<UINT>(x0) + w, static_cast<UINT>(y0) + h, 1 };
+    g_ctx->CopySubresourceRegion(g_curStg, 0, 0, 0, 0, dst, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(g_ctx->Map(g_curStg, 0, D3D11_MAP_READ, 0, &m))) return;
+    std::vector<unsigned char> px(w * h * 4);
+    const unsigned char* src = static_cast<const unsigned char*>(m.pData);
+    for (UINT y = 0; y < h; ++y) {
+        memcpy(&px[y * w * 4], src + y * m.RowPitch, w * 4);
+    }
+    g_ctx->Unmap(g_curStg, 0);
+    for (UINT y = 0; y < h; ++y) {
+        for (UINT x = 0; x < w; ++x) {
+            const unsigned char* a = &g_curPx[(y * kCurW + x) * 4];
+            if (a[3]) {
+                unsigned char* d = &px[(y * w + x) * 4];
+                d[0] = a[0];
+                d[1] = a[1];
+                d[2] = a[2];
+                d[3] = 255;
+            }
+        }
+    }
+    g_ctx->UpdateSubresource(dst, 0, &box, px.data(), w * 4, 0);
+}
+
 static void VrOnPresent(IDXGISwapChain* sc) {
     VrInitOnce();
+    // Live settings, two paths into the same values: the MCM file read directly
+    // (mtime-gated) and the plugin's shared settings block. Applied here before
+    // anything below uses them; upscale on/off is not live (texture sizing
+    // happens at init), only its sharpness is.
+    VrApplyMcm();
+    if (g_shm) {
+        StereoSettings c{};
+        if (ReadStereoSettings(&g_shm->cfg, &c)) {
+            static LONG s_cfgSeq = -1;
+            if (c.seq != s_cfgSeq) {
+                s_cfgSeq = c.seq;
+                g_vrEyeDelay = static_cast<int>(c.eyeDelay);
+                g_vrSwap = c.swapEyes != 0;
+                g_vrWaitPoses = c.waitPoses != 0;
+                g_vrAimRatio = c.aimRatio;
+                g_vrPipboyRatio = c.pipboyRatio;
+                g_vrOverlayWidth = c.screenWidthM;
+                g_vrOverlayDist = c.screenDistanceM;
+                g_vrPipWidth = c.pipWidthM;
+                g_vrPipDist = c.pipDistanceM;
+                g_vrUpSharp = c.upscaleSharpness;
+                Log("vr cfg: eyeDelay=%d swap=%d waitPoses=%d sharp=%.2f ratios %.2f/%.2f screen %.1fm@%.1fm pip %.1fm@%.1fm",
+                    g_vrEyeDelay, g_vrSwap ? 1 : 0, g_vrWaitPoses ? 1 : 0, g_vrUpSharp, g_vrAimRatio,
+                    g_vrPipboyRatio, g_vrOverlayWidth, g_vrOverlayDist, g_vrPipWidth, g_vrPipDist);
+            }
+        }
+    }
     // Frames presented before this one; the plugin picked this frame's eye from the same count.
     const LONG count = g_shm ? InterlockedIncrement(&g_shm->presents) - 1 : static_cast<LONG>(g_vrSubmits);
     if (!g_vrComp || !g_dev || !g_ctx) return;
@@ -1029,6 +1703,7 @@ static void VrOnPresent(IDXGISwapChain* sc) {
         s_focused = true;
         DXGI_SWAP_CHAIN_DESC sd = {};
         if (SUCCEEDED(sc->GetDesc(&sd)) && sd.OutputWindow) {
+            g_gameHwnd = sd.OutputWindow;
             const BOOL ok = SetForegroundWindow(sd.OutputWindow);
             Log("vr: focus game window %p -> %d", (void*)sd.OutputWindow, ok ? 1 : 0);
         }
@@ -1042,8 +1717,24 @@ static void VrOnPresent(IDXGISwapChain* sc) {
     LONG zoom = 0;
     if (g_coverH > 0.0f && g_gameTanX > 0.0f) {
         const float r = g_gameTanX / g_coverH;
-        zoom = r < g_vrPipboyRatio ? 2 : (r < g_vrAimRatio ? 1 : 0);
+        // Order matters: aim_ratio is checked first (narrower FOV), then pipboy_ratio.
+        // If aim_ratio were checked last, the wider Pip-Boy threshold would
+        // shadow it and no eye would ever be marked as aiming.
+        zoom = r < g_vrAimRatio ? 1 : (r < g_vrPipboyRatio ? 2 : 0);
+        // Hysteresis: the ADS FOV animates through the threshold and back, which
+        // flickered the mono/full-IPD switch (double-vision flashes while aiming).
+        // Enter below aim_ratio, hold until aim_ratio + 0.015.
+        if (zoom == 0 && g_zoomPrev == 1 && r < g_vrAimRatio + 0.015f) zoom = 1;
     }
+    // A narrow FOV is the Pip-Boy only if the game drew into its Pip-Boy target this frame;
+    // otherwise (VATS zoom, third-person aim, scopes) treat it as aiming.
+    const bool pipDrawn = g_pipEverDrawn && (count - g_pipDrawnAt) <= 10;
+    static int s_pipDrawnPrev = -1;
+    if (static_cast<int>(pipDrawn) != s_pipDrawnPrev) {
+        Log("vr: pipboy target drawn=%d (target #%ld)", pipDrawn ? 1 : 0, g_pipDrawnIdx);
+        s_pipDrawnPrev = pipDrawn ? 1 : 0;
+    }
+    if (zoom == 2 && g_vrPipProjected && g_pipEverDrawn && !pipDrawn) zoom = 1;
     const LONG camState = g_shm ? g_shm->camState : 0;
     if (g_shm) InterlockedExchange(&g_shm->zoom, zoom);
     if (zoom != g_zoomPrev || camState != g_camStatePrev) {
@@ -1051,12 +1742,27 @@ static void VrOnPresent(IDXGISwapChain* sc) {
             g_coverH > 0.0f ? g_gameTanX / g_coverH : 0.0f, camState);
         g_zoomPrev = zoom; g_camStatePrev = camState;
     }
-    const bool flat = !g_shm || g_seqStill >= g_vrFlatAfter || (zoom == 2 && g_vrPipboy2D)
+    // Pip-Boy open = the game draws into its Pip-Boy target (the FOV does not always narrow).
+    const bool pipOpen = g_vrPipProjected && pipDrawn;
+    const bool flat = !g_shm || g_seqStill >= g_vrFlatAfter || (zoom == 2 && g_vrPipboy2D) || (pipOpen && g_vrPipboy2D)
                       || (g_vrOtherCams2D && camState >= 0 && camState < 32 && !(g_vrCamMask & (1u << camState)));
     if (g_shm) InterlockedExchange(&g_shm->flatMode, flat ? 1 : 0);
     if (static_cast<int>(flat) != g_flatPrev) {
         Log("vr: mode -> %s (frame %ld seq %ld)", flat ? "2D screen" : "3D stereo", count, seq);
         g_flatPrev = flat ? 1 : 0;
+    }
+    // Mono aim = first-person aim: the plugin renders both frames from the same
+    // offset (g_shm->zoom is exactly the value the plugin uses for aimFp), so the
+    // eye bounds must collapse to one shared window (VrEyeBounds).
+    g_monoAim = !flat && zoom == 1 && camState == 0;
+
+    // [vr] mouse: SteamVR's dashboard takes foreground and the game stops receiving
+    // mouse input (Pip-Boy UI dead, no cursor). Re-assert focus every ~2 s, but only
+    // while the 3D view is active — when the player Alt+Tabs to the desktop we must
+    // not steal focus back, or the cursor stays stuck in the game window.
+    if (g_gameHwnd && !flat && (count & 127) == 0 && GetForegroundWindow() != g_gameHwnd) {
+        const BOOL ok = SetForegroundWindow(g_gameHwnd);
+        Log("vr: focus lost -> re-assert %p -> %d", (void*)g_gameHwnd, ok ? 1 : 0);
     }
 
     ID3D11Texture2D* bb = nullptr;
@@ -1064,15 +1770,47 @@ static void VrOnPresent(IDXGISwapChain* sc) {
     VrEnsureTextures(bb);
     if (!g_eyeTex[0]) { bb->Release(); return; }
 
-    LONG eye = (count - g_vrEyeDelay) & 1;
+    // The plugin alternates the eye per camera update and records it in
+    // shm->eye (published before the seq bump). Follow that record instead of
+    // deriving the eye from the present count: (count - eyeDelay) & 1 raced
+    // the camera updates whenever a present landed before the next update,
+    // repeating an eye every few frames (constant left-right wobble).
+    // eye_delay selects the update lag: 0 = the newest update's eye, 1 = the
+    // one before it (the render thread lags the game thread by one update).
+    static LONG s_seqSeen = -1, s_eyeCur = 0, s_eyePrev = 0;
+    if (g_shm) {
+        const LONG seq = g_shm->seq;
+        if (seq != s_seqSeen) {
+            s_seqSeen = seq;
+            s_eyePrev = s_eyeCur;
+            s_eyeCur = g_shm->eye;
+        }
+    }
+    LONG eye = (g_vrEyeDelay ? s_eyePrev : s_eyeCur) & 1;
     if (g_vrSwap) eye ^= 1;
 
     ID3D11Texture2D* dst = flat ? g_flatTex : g_eyeTex[eye];
     D3D11_TEXTURE2D_DESC d = {};
     bb->GetDesc(&d);
     if (dst) {
-        if (d.SampleDesc.Count > 1) g_ctx->ResolveSubresource(dst, 0, bb, 0, d.Format);
-        else g_ctx->CopyResource(dst, bb);
+        bool upscaled = false;
+        if (!flat && g_upW && g_upMidUav && g_upMidBUav) {
+            // [vr] upscale=1: FSR1 EASU+RCAS backbuffer -> eye texture at the headset size.
+            upscaled = VrUpscale(bb, dst);
+        }
+        if (!upscaled) {
+            if (!flat && g_upW) {
+                // Size mismatch: CopyResource silently no-ops -> uninitialized (black) eye.
+                static bool s_fbLogged = false;
+                if (!s_fbLogged) {
+                    s_fbLogged = true;
+                    Log("vr: upscale unavailable, plain copy no-ops across sizes (bb %ux%u eye %ux%u)",
+                        d.Width, d.Height, g_upW, g_upH);
+                }
+            }
+            if (d.SampleDesc.Count > 1) g_ctx->ResolveSubresource(dst, 0, bb, 0, d.Format);
+            else g_ctx->CopyResource(dst, bb);
+        }
     }
     bb->Release();
 
@@ -1083,10 +1821,19 @@ static void VrOnPresent(IDXGISwapChain* sc) {
     }
 
     if (flat && g_vrOverlay && g_overlay != vr::k_ulOverlayHandleInvalid && g_flatTex) {
-        vr::Texture_t ftex = { g_flatTex, vr::TextureType_DirectX, vr::ColorSpace_Auto };
+        // Pip-Boy: show the game's Pip-Boy UI target (projected Pip-Boy) instead of the zoomed frame.
+        ID3D11Texture2D* pip = pipOpen ? VrPipboyTexture() : nullptr;
+        ID3D11Texture2D* shown = pip ? pip : g_flatTex;
+        DrawOverlayCursor(shown);  // the OS cursor never lands in the render target
+        vr::Texture_t ftex = { shown, vr::TextureType_DirectX, vr::ColorSpace_Auto };
         g_vrOverlay->SetOverlayTexture(g_overlay, &ftex);
+        if ((pip != nullptr) != g_overlayIsPip) {
+            g_overlayIsPip = pip != nullptr;
+            VrPlaceOverlay(g_overlayIsPip);
+            Log("vr: 2D screen shows %s", g_overlayIsPip ? "Pip-Boy target" : "game frame");
+        }
         if (!g_overlayShown) {
-            VrPlaceOverlay();
+            VrPlaceOverlay(g_overlayIsPip);
             g_vrOverlay->ShowOverlay(g_overlay);
             g_overlayShown = true;
         }
@@ -1101,8 +1848,13 @@ static void VrOnPresent(IDXGISwapChain* sc) {
         vr::Texture_t tex = { src, vr::TextureType_DirectX, vr::ColorSpace_Auto };
         vr::VRTextureBounds_t bounds = { 0.0f, 0.0f, 1.0f, 1.0f };
         const bool useBounds = !flat && g_vrUseBounds && VrEyeBounds(i, bounds);
-        if (useBounds && g_boundsLogged < 2) {
-            g_boundsLogged++;
+        // Log on change (not just the first two): bounds moving per eye tells
+        // whether the crop keeps a horizontal offset between the eyes (mono aim
+        // must collapse them to the same window for a real single image).
+        static float s_bU0[2] = { -1.0f, -1.0f }, s_bV0[2] = { -1.0f, -1.0f };
+        if (useBounds && (std::fabs(bounds.uMin - s_bU0[i]) > 0.003f || std::fabs(bounds.vMin - s_bV0[i]) > 0.003f)) {
+            s_bU0[i] = bounds.uMin;
+            s_bV0[i] = bounds.vMin;
             Log("vr: eye %d bounds u=%.3f..%.3f v=%.3f..%.3f (game tan x=%.3f y=%.3f)", i, bounds.uMin, bounds.uMax,
                 bounds.vMin, bounds.vMax, g_gameTanX, g_gameTanY);
         }
@@ -1252,6 +2004,40 @@ static void SetVtEntry(void** vtbl, int idx, void* replacement) {
 static std::mutex g_hookMtx;
 
 // Patch one vtable once, remembering its own originals.
+// Pip-Boy detection: the game draws into its Pip-Boy target only while the Pip-Boy is open.
+// RTVs of the captured targets are recorded at creation; binding one marks the frame.
+
+static LONG PresentCount() { return g_shm ? g_shm->presents : 0; }
+
+static void NotePipRtvs(UINT n, ID3D11RenderTargetView* const* rtvs) {
+    const LONG cnt = g_pipRtvCount;
+    if (!rtvs || cnt == 0) return;
+    for (UINT i = 0; i < n; ++i) {
+        if (!rtvs[i]) continue;
+        for (LONG k = 0; k < cnt; ++k) {
+            if (g_pipRtv[k] == rtvs[i]) {
+                InterlockedExchange(&g_pipDrawnAt, PresentCount());
+                InterlockedExchange(&g_pipDrawnIdx, g_pipRtvCand[k]);
+                InterlockedExchange(&g_pipEverDrawn, 1);
+                return;
+            }
+        }
+    }
+}
+
+static void STDMETHODCALLTYPE HookedOMSetRT(ID3D11DeviceContext* self, UINT n, ID3D11RenderTargetView* const* rtvs,
+                                            ID3D11DepthStencilView* dsv) {
+    NotePipRtvs(n, rtvs);
+    FindVt(self)->omSetRT(self, n, rtvs, dsv);
+}
+
+static void STDMETHODCALLTYPE HookedOMSetRTUav(ID3D11DeviceContext* self, UINT n, ID3D11RenderTargetView* const* rtvs,
+                                               ID3D11DepthStencilView* dsv, UINT uavStart, UINT nUav,
+                                               ID3D11UnorderedAccessView* const* uavs, const UINT* counts) {
+    if (n != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) NotePipRtvs(n, rtvs);
+    FindVt(self)->omSetRTUav(self, n, rtvs, dsv, uavStart, nUav, uavs, counts);
+}
+
 static void HookOneVtable(void* iface, const char* name) {
     if (!iface) return;
     std::lock_guard<std::mutex> lock(g_hookMtx);
@@ -1275,6 +2061,8 @@ static void HookOneVtable(void* iface, const char* name) {
     vt.copySub = reinterpret_cast<CopySubFn>(vtbl[kCopySubresourceRegion]);
     vt.copyRes = reinterpret_cast<CopyResFn>(vtbl[kCopyResource]);
     vt.updateSub = reinterpret_cast<UpdateSubFn>(vtbl[kUpdateSubresource]);
+    vt.omSetRT = reinterpret_cast<OMSetRTFn>(vtbl[kOMSetRenderTargets]);
+    vt.omSetRTUav = reinterpret_cast<OMSetRTUavFn>(vtbl[kOMSetRenderTargetsAndUAVs]);
     InterlockedExchange(&g_nvt, n + 1);  // publish before patching
 
     SetVtEntry(vtbl, kVSSetConstantBuffers, reinterpret_cast<void*>(&HookedVSSetCB));
@@ -1285,6 +2073,8 @@ static void HookOneVtable(void* iface, const char* name) {
     SetVtEntry(vtbl, kCopySubresourceRegion, reinterpret_cast<void*>(&HookedCopySub));
     SetVtEntry(vtbl, kCopyResource, reinterpret_cast<void*>(&HookedCopyRes));
     SetVtEntry(vtbl, kUpdateSubresource, reinterpret_cast<void*>(&HookedUpdateSub));
+    SetVtEntry(vtbl, kOMSetRenderTargets, reinterpret_cast<void*>(&HookedOMSetRT));
+    SetVtEntry(vtbl, kOMSetRenderTargetsAndUAVs, reinterpret_cast<void*>(&HookedOMSetRTUav));
     Log("Hooked %s vtable %p (iface %p)", name, (void*)vtbl, iface);
 }
 
@@ -1306,12 +2096,84 @@ static void HookContext(ID3D11DeviceContext* ctx) {
     }
 }
 
+typedef HRESULT(STDMETHODCALLTYPE* CreateTex2DFn)(ID3D11Device*, const D3D11_TEXTURE2D_DESC*,
+                                                  const D3D11_SUBRESOURCE_DATA*, ID3D11Texture2D**);
+static CreateTex2DFn g_origCreateTex2D = nullptr;
+
+static bool IsDepthFormat(DXGI_FORMAT f) {
+    return f == DXGI_FORMAT_R24G8_TYPELESS || f == DXGI_FORMAT_D24_UNORM_S8_UINT || f == DXGI_FORMAT_R32_TYPELESS
+        || f == DXGI_FORMAT_D32_FLOAT || f == DXGI_FORMAT_R16_TYPELESS || f == DXGI_FORMAT_D16_UNORM
+        || f == DXGI_FORMAT_R32G8X24_TYPELESS || f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+}
+
+// Records the game's Pip-Boy UI render target(s): textures of the uPipboyTarget size that are
+// colour render targets. Our own textures have no render-target bind and are not recorded.
+static HRESULT STDMETHODCALLTYPE HookedCreateTex2D(ID3D11Device* self, const D3D11_TEXTURE2D_DESC* desc,
+                                                   const D3D11_SUBRESOURCE_DATA* init, ID3D11Texture2D** out) {
+    HRESULT hr = g_origCreateTex2D(self, desc, init, out);
+    if (SUCCEEDED(hr) && desc && out && *out && desc->Width == g_pipTargetW && desc->Height == g_pipTargetH
+        && (desc->BindFlags & D3D11_BIND_RENDER_TARGET) && !IsDepthFormat(desc->Format)) {
+        AcquireSRWLockExclusive(&g_pipLock);
+        if (g_pipCandCount < 8) {
+            (*out)->AddRef();  // kept for the process lifetime (created once at startup)
+            g_pipCand[g_pipCandCount++] = *out;
+        }
+        const int n = g_pipCandCount;
+        ReleaseSRWLockExclusive(&g_pipLock);
+        Log("vr: pipboy-size render target #%d %p fmt=%d bind=0x%x misc=0x%x mips=%u array=%u samples=%u", n - 1,
+            (void*)*out, (int)desc->Format, desc->BindFlags, desc->MiscFlags, desc->MipLevels, desc->ArraySize,
+            desc->SampleDesc.Count);
+    }
+    return hr;
+}
+
+typedef HRESULT(STDMETHODCALLTYPE* CreateRtvFn)(ID3D11Device*, ID3D11Resource*, const D3D11_RENDER_TARGET_VIEW_DESC*,
+                                                ID3D11RenderTargetView**);
+static CreateRtvFn g_origCreateRtv = nullptr;
+
+static HRESULT STDMETHODCALLTYPE HookedCreateRtv(ID3D11Device* self, ID3D11Resource* res,
+                                                 const D3D11_RENDER_TARGET_VIEW_DESC* desc,
+                                                 ID3D11RenderTargetView** out) {
+    HRESULT hr = g_origCreateRtv(self, res, desc, out);
+    if (SUCCEEDED(hr) && res && out && *out) {
+        int cand = -1;
+        AcquireSRWLockShared(&g_pipLock);
+        for (int i = 0; i < g_pipCandCount; ++i) {
+            if (static_cast<ID3D11Resource*>(g_pipCand[i]) == res) { cand = i; break; }
+        }
+        ReleaseSRWLockShared(&g_pipLock);
+        if (cand >= 0) {
+            AcquireSRWLockExclusive(&g_pipLock);
+            const LONG n = g_pipRtvCount;
+            if (n < 32) {
+                (*out)->AddRef();  // keep the pointer valid for comparisons
+                g_pipRtv[n] = *out;
+                g_pipRtvCand[n] = cand;
+                InterlockedExchange(&g_pipRtvCount, n + 1);
+            }
+            ReleaseSRWLockExclusive(&g_pipLock);
+            Log("vr: pipboy target #%d render target view %p", cand, (void*)*out);
+        }
+    }
+    return hr;
+}
+
 static void HookDevice(ID3D11Device* dev) {
     void** vtbl = *reinterpret_cast<void***>(dev);
     // ID3D11Device: IUnknown(3) => CreateDeferredContext = 27
     HookVtableEntry(vtbl, 27, reinterpret_cast<void*>(&HookedCreateDeferred),
                     reinterpret_cast<void**>(&g_origCreateDeferred));
-    Log("Hooked device %p (CreateDeferredContext)", (void*)dev);
+    if (g_vrEnabled && g_vrPipProjected) {
+        LoadPipboyTargetSize();
+        // ID3D11Device: IUnknown(3), CreateBuffer 3, CreateTexture1D 4 => CreateTexture2D = 5
+        HookVtableEntry(vtbl, 5, reinterpret_cast<void*>(&HookedCreateTex2D),
+                        reinterpret_cast<void**>(&g_origCreateTex2D));
+        // CreateShaderResourceView 7, CreateUnorderedAccessView 8 => CreateRenderTargetView = 9
+        HookVtableEntry(vtbl, 9, reinterpret_cast<void*>(&HookedCreateRtv),
+                        reinterpret_cast<void**>(&g_origCreateRtv));
+    }
+    Log("Hooked device %p (CreateDeferredContext%s)", (void*)dev,
+        g_origCreateTex2D ? ", CreateTexture2D" : "");
 }
 
 static bool LoadReal() {

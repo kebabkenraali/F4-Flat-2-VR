@@ -1,12 +1,175 @@
 # Status: Fallout 4 flat -> VR (stereo + gamepad)
 
-Päivitetty: 2026-11-11
+Päivitetty: 2026-11-13
 
 ## Tavoite
 
 Flat Fallout 4 pelattavaksi VR-laseilla niin, että näkymä täyttää koko näkökentän ja ohjaus tapahtuu Xbox-ohjaimella. Stereo (aito kahden silmän kuva) on ensisijainen tavoite. Ohjainsilta on toissijainen.
 
 ## Mitä on tehty
+
+### Oppi muista projekteista (suunnittelu)
+
+Projekti on saanut inspiraatiota erityisesti [CyberpunkVR Port](https://github.com/dariulone/cyberpunk-vr-port) -projektista (MIT-lisenssi, tekijä dariulone ja yhteisö). Siitä voidaan oppia seuraavia suunnitteluratkaisuja, jotka ovat sovellettavissa Fallout 4:n flat-to-VR -portaukseen:
+
+- **Aito stereo, ei uudelleenprojisointia:** toinen silmä on oma moottorin render-kamera, joka renderöidään omaksi tekstuurikseen omasta sijainnistaan ja omalla projisiolla.
+- **AFW (Alternate Frame Warping):** silmät vuorottelevat kehyksissä, toisen silmän kuva rekonstruoidaan edellisen kehyksen syvyyden ja liikkeen perusteella (nopea, GPU-säästöinen).
+- **Asymmetrinen projektio per silmä:** jokaisen silmän näkymä rajataan headsetin linssikentän mukaiseksi, ei symmetrinen frustiimi.
+- **OpenXR head tracking:** HMD-asento injektoidaan render-polkuihin, per-eye depth-kerrokset (`XR_KHR_composition_layer_depth`) parantavat reprojektiota.
+- **Natiivinen VR-HUD:** HUD-elementit sijoitetaan omille paneeleilleen, näkymän lukitus ja free-look-kartiot säädettävissä.
+- **FSR1 upscale:** pelikuva skaalataan headsetin suosittelemaan per-silmä tarkkuuteen ei-temporaalisesti, mikä on VR-turvallista.
+
+Lisäoppija (luettu reposton ajantasaisesta README:stä 13.11.2026), suoraan sovellettavissa tämän projektin tunnettuihin rajoitteisiin:
+
+- **AFW + oma rekonstruktio (OSR):** silmät vuorottelevat kehyksissä, mutta toinen silmä rakennetaan edellisen kehyksen väristä, syvyydestä ja liikkeestä (~0,44 ms GPU), joten kehyksen hinta on ~yksi silmä eikä frameraate jakaudu kahtia. Tämä on suora vastaus meidän "silmät vuorottelevat → puolet frameraatesta" -rajoitteeseemme; me vain toimitamme vuorottelevat kehykset ilman rekonstruktiota.
+- **Näkymät tunnistetaan nimellä, ei eliminoinnilla:** ei "kaikki mikä ei ole toinen silmä on MAIN", vaan virtuaalikameran nimen hash — eliminoiva tunnistus tuotti toisessa projektissa valkoisen toisen silmän ja jumit. Meidän proxy tunnistaa kameratilat indeksillä; sama oppi pätee Pip-Boy-kohteen valintaan (`pipboy_target_index`).
+- **Molempien näkymien pitää sopia yhteen:** varjokaskadit, shader-kello, tuulitilavuus ja heijastusmarssi olivat rakenteita, jotka toinen näkymä rakensi omasta frustumistaan → vilkkuvat varjot ja tärisevä kasvillisuus. Ratkaisu: molemmat silmät lainaavat samoja rakenteita. Meidän ratkaisumme (silmäsiirto moottorin omassa kamerassa) välttää ongelman lähtökohtaisesti, mutta oppi kannattaa muistaa jos näkymät joskus erotetaan.
+- **Upskalerille oma konteksti per silmä:** temporaaliset upskalerit (FSR2/DLSS) keräävät toisen silmän historiaa → IPD:n levyinen aave. Meidän FSR1 on ei-temporaalinen ja turvallinen, mutta jos joskus siirrytään FSR2/DLSS:ään, konteksti pitää jakaa per silmä.
+- **Per-silmä syvyyskerros submitissä:** runtime-reprojektio tietää missä asiat ovat (me OpenVR:ssä tämä olisi `IVRCompositor::SubmitWithLayer` + depth).
+- **GPU-säästöt:** piilomaski linssien reunoille, kiinteä foveaatio (FFR/VRS) ja jaetut auringonvarjot — pieni kustannus, iso voitto resoluutiorajoitteisessa kokoonpanossa.
+- **Exposure mitataan ympäristöstä, ei kameran suunnasta:** valotus ei enää pyrähdy kun kääntää päätä. Fallout 4:n autoexposure-ominaisuudet voisivat hyötyä samasta periaatteesta.
+
+**Credits:** dariulone (pääsuunnittelija), iPowerTech, dabinn, Ajson44, tig3rmast3r/OFXR Bridge, satyaloka93, Syncher-source, EffinexX (katso tarkemmat krediitit CyberpunkVR Port -repossa). Projektissa **ei ole kopioitu koodia** CyberpunkVR Portista, vaan se on toiminut viite- ja inspiraationa.
+
+### MCM-tuki (13.11.2026)
+
+- **MCM-valikko tehty** (MCM-ydin, mod 21497): `Data\MCM\Config\F4Flat2VR\` (repo: `mcm/F4Flat2VR/`).
+  Kaksi sivua — *Stereo* (IPD, pään kierto/kompensointi/paikka, units/meter, aim-IPD, konvergenssi) ja
+  *VR-näkymä* (eye_delay, swap_eyes, wait_poses, FSR1-terävöinti, 2D-ruudun koko/etäisyys, aim/pipboy-ratiot,
+  Pip-Boyn koko/etäisyys). Oletusarvot `settings.ini`, tekstit suomeksi.
+- **Sovellusprosessi:** MCM kirjoittaa käyttäjän asetukset `Data\MCM\Settings\F4Flat2VR.ini`; pluginin
+  poll-säie (500 ms) lukee muutokset mtimen perusteella, soveltaa stereoarvot suoraan moottorikoukkuihin ja
+  puskee VR-arvot jaetun muistin uuteen asetuslohkoon (shm v3 `StereoSettings`, seqlock), jonka proxy lukee
+  jokaisen Presentin alussa. Upscale päälle/pois ei ole live (tekstuurikoot luodaan alustuksessa) — vain
+  terävöinti on; siksi kytkintä ei ole valikossa lainkaan.
+- Vanha SHM-nimi vaihtui `fo4stereo_shm_v2` → `v3`; molemmat DLL:t käännetty ja asennettu
+  (varmuuskopiot `*.bak_mcm`). MCM-tiedostot asennettu `deploy_mcm.ps1`-skriptillä.
+- **HUOM: itse MCM-ydin (Nexus mod 21497) ei ole asennettuna** — pelissä on vain MCM Settings Manager
+  (56195), joka vaatii ytimen toimiakseen. Käyttäjän pitää asentaa MCM 21497 (Vortex tai manuaalisesti),
+  ennen kuin valikko näkyy Pause-menussa.
+
+### MCM-korjaukset (14.11.2026)
+
+- **Juurisyy sille, ettei VR-sivun säädöillä ollut vaikutusta:** `WriteStereoSettings` teki kokonaisrakennekopion,
+  joka ylikirjoitti `seq`-laskurin nollalla → seq jäi parittomaksi → lukijan seqlock piti lohkoa "kirjoitus kesken"
+  ikuisesti ja proxy ei koskaan lukenut sitä. Eristetty testi (`tmp/test_shm/`) vahvisti: kirjoittaja jätti `seq=1`.
+  Korjaus: kirjoitus ja luku kenttä kerrallaan (`stereo_shm.h`), testi vahvistaa `seq=2, read ok=1`.
+- **Proxy lukee MCM-tiedoston nyt suoraan** (`Data\MCM\Settings\F4Flat2VR.ini`, mtime-portti, `VrApplyMcm`
+  Presentissä) — varmempi polku, joka ei ole riippuvainen pluginin shm-puskusta. Molemmat polut soveltavat
+  samat arvot.
+- **Dominantti silmä (uusi asetus):** MCM Stereo-sivu *Dominantti silmä* (keskellä/vasen/oikea). Kun tähdätään
+  mono-tilassa (`fAimIpdScale=0`), kamera siirtyy dominantin silmän paikalle — tähtäysnäkymä vastaa silmää jolla
+  tähtäämä tapahtuu, eikä konvergenssin kääntö nytkähdä (etumerkki sidottu siirtymän suuntaan, ei vuorottelevaan
+  silmään). Pistoolin tuplakuvien syy: täysi stereo lähietäisyydellä (aim_ipd_scale=1) + konvergenssivirhe;
+  mono + dominantti silmä on oikea ratkaisu.
+- MCM-käyttäjäasetukset palautettu järkeviin arvoihin (`fIPDUnits=4.48`, `fConvergeM=1.5`, `bEyeDelay=1`,
+  `iDominantEye=2`): edellisen testin lopussa IPD oli jäänyt 0:aan (stereo pois).
+- Molemmat DLL:t käännetty ja asennettu, MCM-valikkotiedostot päivitetty peliin.
+
+### Allekirjoitettu tähtäysoffset + oletukset (14.11.2026)
+
+- **`fAimIpdScale` on nyt allekirjoitettu liuku (−2..2)**, joka korvaa dominant-silmä-steppeerin
+  (`iDominantEye` poistettu). Arvo on silmän paikka puolen silmäetäisyyden murto-osana tähdätessä:
+  `0 = keskellä (mono)`, `+1 = oikean silmän paikka`, `−1 = vasemman silmän paikka`, |arvo| > 1 työntää
+  kauemmas. Molemmat kehykset käyttävät samaa offsetia → tähtäin näyttää yhden kuvan; etumerkki ratkaisee
+  miltä silmältä näkymä on. Käyttäjän vahvistus: maksimiasento loi väärän kuvan, 0 ei ole vieläkään
+  ihanteellinen → nyt voi hienosäätää millä tahansa välillä −2..2. Konvergenssin määrä tähdätessä on
+  `|fAimIpdScale| × 0,5 × IPD` ja kääntösidottu siirtymän suuntaan (ei vaihda kehyksestä toiseen).
+- **Käyttäjän viritetyt arvot tallennettu oletuksiksi** (`mcm/F4Flat2VR/settings.ini`): IPD 4.48,
+  pään kierto 1, head_pos 1, units/m 70, konvergenssi 4.0, eye_delay 1, FSR-sharp 0.55,
+  2D-ruutu 3.0 m @ 1.6 m, Pip-Boy 3.0 m @ 2.0 m, ratiot 0.95/0.75, `fAimIpdScale=−1` (käyttäjä
+  tähtää vasemmalla silmällä).
+- Plugin käännetty ja asennettu (peli kiinni, hash tarkistettu). Proxy muuttumaton.
+- **FRIK (Fallout-4-VR-Body): GPL-3.0 → ei koodia, vain ideat** (projekti on MIT): aseiden
+  uudelleensijoitus-offsetit, kamera/keho-kohdistus, fyysinen Pip-Boy, asetusten hot-reload.
+  Koodin porttaisi GPL:n alle — viitataan README:n credits-taulukossa ("No code copied").
+
+### Aim-korjaukset: vain 1. persoona + mono ilman toe-iniä (14.11.2026, toinen kierros)
+
+- Käyttäjätesti: sliderin muutos ei näyttänyt vaikuttavan; ase näkyy normaalisti kun sitä katsoo,
+  mutta tähdätessä väärin — sekä 3. että 1. persoonassa. Loki vahvisti: `aim 1 (zoom=1) ipdScale=-0.4`,
+  eli tunnistus ja sovellus toimivat, mutta **aim-logiikka osui myös 3. persoonaan** (tila 7, joka jakaa
+  vtablet tilan 8 kanssa → maskiin kuuluu) ja **toe-in-yaw kiersi mono-näkymää** (identtiset kehykset
+  → koko kuva ja ristikko kääntyi luodinradasta).
+- Korjaus: aim-mono-offset vain `camState == 0`; 3. persoonan tähtäys käyttää tavallista stereoa.
+  Konvergenssin toe-in vain vuorotteleville stereo-kehyksille — mono-tähtäyksessä yaw = 0.
+- Odottaa käyttäjätestiä: tähtäys 1. persoonassa arvoilla 0/−1/+1 (ja ääriarvot ±2, koska pienet
+  arvot ≈ 1 cm siirtymä eivät juuri näy) ja 3. persoonan tähtäys. Mahdolliset jatkot käyttäjän
+  ehdotuksista: per-silmä asepiirto (piilota ase toisen silmän kehyksestä — klassinen S3D-keino,
+  mahdollinen koska plugin tietää silmän per kehys) tai aseen/etureisien siirto eteenpäin
+  (FRIK-tyylinen weapon offset, idea vain — FRIK on GPL).
+
+### Silmävalinnan korjaus: vuorottelu irti present-pariteetista (14.11.2026, kolmas kierros)
+
+- Käyttäjäraportti: kamera heiluu vasemmalla-oikealla koko ajan; tähtäyksessä ei eroa eikä tuplakuva
+  poistunut. Juurisyy löytyi laskureista: **silmä valittiin present-laskurin pariteetilla**
+  (`presents & 1`), mutta render-säie ja pelisäie kilpailevat — present voi osua ennen tai jälkeen
+  seuraavan kamerapäivityksen, jolloin silmä **toistuu** (sama silmänäkymä kahdesti, toisen silmän
+  tekstuuri jää vanhaksi) → vakio vasemmalla-oikealla-heilunta. Mittaus: in-game presents/update ≈ 1:1
+  mutta jitteraen; paussit (MCM-valikko) siirtävät pariteettifaasia satunnaiseen kohtaan.
+- **Korjaus:** plugin vuorottelee silmän itse **kamera-päivitysten tahdissa** (`eye ^= 1` per
+  HookedStateUpdate — sama muuttuja jolla kameransiirto tehdään → täydellinen lukitus), ja proxy
+  seuraa kirjattua silmää seq-historian kautta (`s_eyePrev/s_eyeCur`, eye_delay = päivitysviive:
+  0 = uusin päivitys, 1 = edellinen). Paussifaasioitsuma ja jatkuva huojunta poistuvat kokonaan;
+  mahdollinen jäljelle jäävä virhe on korjattavissa swap_eyes/eye_delay-kytkimillä.
+- Molemmat DLL:t käännetty ja asennettu (peli kiinni, hashit). Käyttäjän swap_eyes palautettu 0:aan
+  (uusi kaava muuttaa kalibroinnin); eye_delay=1 pidettiin (render-säie jäljessä ~1 päivitys).
+- Seuraava askel jos tuplakuva tähtäyksessä jää: per-silmän bounds-rajauksen yhdistäminen mono-tähdätessä
+  (kommentti koodissa: "mono aim must collapse them to the same window") tai päänseurannan vaimennus
+  tähtäyksen aikana (moottorin oma ADS-kohdistus rikkoutuu head-pos/rot-offseteista).
+
+### Asetusten ylityskorjaus + mono-tähtäyksen rajaus (14.11.2026, neljäs kierros)
+
+- Käyttäjäraportti: kamera heiluu yhä kuin ensimmäisessä prototyypissä (pääosin paikallaan ollessa),
+  tuplakuva tähtäyksessä jää, vasemmanpuoleisesta kopiosta puuttui aseen etupään osa, slider ei
+  näytä vaikuttavan tähtäyksessä.
+- **Loki selitti paljon**: plugin-loki pelin aikana näyttää `aim 1 ... ipdScale=0` ja enginen
+  tilannerivin `convergence_m=0 head_rot_compensate=false` — vaikka MCM-lukija oli käynnistyksessä
+  lukenut `aim_ipd_scale 0 -> 2` ja `convergence_m 1.5 -> 7.5`. Eli **LoadEngineConfig()**
+  (kutsutaan hook-asennuksessa pelin latauduttua) luki fo4stereo.inin ja **ylsitti MCM-lukijan jo
+  asettamat arvot** takaisin ini-oletuksiin. MCM-pollisilmukka kirjoittaa vain ini-muutoksilla,
+  joten ylitys jäi voimaan koko session ajaksi. Tämä selitti kolme vanhaa palautettaa kerralla:
+  - konvergenssi "ei toimi / ei eroa" → runtime-arvo oli 0,
+  - aim-slider "ei näy vaikuttavan" → runtime-arvo oli 0,
+  - mahdollinen paikallaanheilunta: head_rot_compensate oli runtimessa false (palautettaessä
+    true se kompensoi kiertopalautetta, joka vahvistaa pään mikrolikat paikallaan).
+- **Korjaus 1 (plugin):** hook-asennuksessa LoadEngineConfigin jälkeen `g_mcmHave=false; ApplyMcm();`
+  → MCM-arvot pakotetaan takaisin pelin latauduttua (lokiin tulee mcm-rivit jos arvot erosivat).
+- **Korjaus 2 (proxy):** mono-tähtäyksen bounds-yhdistys. Lokin bounds-rivit vahvistivat
+  per-silmän rajauksen eron: eye 0 u=0.000..0.821, eye 1 u=0.179..1.000 (~18 % ikkunaeiro);
+  sama kuva kahdella eri rajauksella = tuplakuva ja katkennut aseen etupää. Kun zoom==1 ja
+  camState==0 (mono-tähtäys, `g_monoAim`), VrEyeBounds käyttää molemmilla silmillä **keskiarvo-
+  ikkunaa** (pään keskiö), jolloin molemmat silmät näkevät identtisen kuvan.
+- Rakennettu ja asennettu (peli kiinni): plugin hash 527CC186..., proxy hash 828AEEBF...
+- Huomio logista: proxy-näytteistysrivi näytti eye=1 vakiona — selittyi näytteistyksellä (joka 600.
+  frame, seq edistyy täsmälleen 600/600 → pariteetti aina sama); vuorottelu itsessään todettiin
+  toimivaksi (getTrans-loki: eye vuorottelee 0/1 per päivitys, updates/presents 1:1).
+
+### Oletusten palautus + pelikansion siivous (14.11.2026, viides kierros)
+
+- Käyttäjäraportti: huonompi kuin koskaan. Heilunta jatkui; **normaali 1. persoonan kuva (ilman
+  tähtäystä) näytti kahtena, ase mukaan lukien**. Pyysi: palauta oletusasetukset (Pip-Boy-arvot
+  jäävät), ja varmista ettei pelikansioon ole jäänyt ongelmallisia tiedostoja.
+- Analyysi: edellisen kierroksen korjaus aktivoi ensimmäistä kertaa **todellisuudessa** arvot, jotka
+  olivat olleet kuolleet (stomp-bugin takia): konvergenssi 7.5 ja rotComp=true. Kaikki käyttäjän
+  aiemmat testit ja "parhaat" tulokset oli saatu tilassa, jossa nämä olivat 0/false — joten akti-
+  voituessaan ne muuttivat kokemusta, eivät parantaneet sitä. Lisäksi bEyeDelay=1 oli viritetty
+  VANHAN kaavan semantiikalla (present-lag); uudessa seq-historia-kaavassa se voi tarkoittaa
+  systemaattista silmäpariteetin vaihtoa → käänteinen stereoparallaksi → tuplakuva koko näkymässä.
+- **Toimenpiteet:**
+  - Käyttäjän MCM-ini palautettu oletuksiin: IPD 4.48, headRot 1, rotComp 0, headPos 1, units 70,
+    aimIpdScale -1, **convergence 0** (isoitu pois; kokeillaan uudestaan kun fuusio kunossa),
+    **eyeDelay 0** (uuden kaavan semantiikka: 0 = uusin päivitys; A/B-testi MCM:llä),
+    swap 0. Pip-Boy (3.0 m @ 2.0 m) säilytettiin.
+  - Projektin settings.ini päivitetty vastaamaan (uusi oletuspohja).
+  - Pelikansio siivottu: kaikki .bak-tiedostot (12 kpl d3d11/fo4stereo-varmuuskopioita) ja
+    virheelliset kopiot (Data\F4SE\fo4flat_probe.dll + 4 vanhaa .bakia, Plugins\*.bak_mcm)
+    siirretty tmp\game_backups\ (ei poistettu). Jäljellä: d3d11.dll (proxy), fo4stereo.ini,
+    lokit, Data\F4SE\Plugins\fo4flat_probe.dll (ainoa plugin-kopio), mcm.dll, version-bin.
+    dxgi.dll ei ole olemassa (ei konfliktia).
+- **Testi-ohje käyttäjälle:** jos normaalinäkymä fuusioituu (ei tuplakuvaa) ja heilunta poistuu →
+  valmista; jos tuplakuva jää → käännä MCM:ssä "Silmäviive" (bEyeDelay) 0↔1 — vain kaksi
+  eri pariteettiparia on olemassa, joten jompikumpi kahdesta asennosta fuusioituu.
 
 ### Ympäristö
 - Flat Fallout 4 asennettu: `D:\SteamLibrary\steamapps\common\Fallout 4` (versio 1.11.240.0, Next-Gen).
@@ -306,3 +469,10 @@ Flat Fallout 4 pelattavaksi VR-laseilla niin, että näkymä täyttää koko nä
 | vcpkg | `C:\vcpkg` |
 | RenderDoc-kaappaukset | `%USERPROFILE%\AppData\Local\Temp\RenderDoc` |
 | Analyysi | `…\scratchpad\renderdoc\cbpass_dump.txt` |
+## New fixes (13.11.2026)
+
+- Mouse capture (ClipCursor) removed from proxy so Alt-Tab to desktop works.
+- pipboy_ratio 0.5 -> 0.75, aim_ratio 0.98 -> 0.95, aim_ipd_scale=0 (mono).
+- Instrumentation added: proxy logs vr: eye N bounds..., plugin logs aim{} conv yaw....
+- Build & deploy: d3d11.dll and fo4flat_probe.dll deployed.
+
