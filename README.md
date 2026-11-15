@@ -2,7 +2,7 @@
 
 Play the regular (flat) **Fallout 4** in a **VR headset** with real stereo 3D, head tracking and a gamepad.
 
-> **Status: experimental, but playable.** Tested with Fallout 4 1.11.240 (Next-Gen, Steam), F4SE 0.7.9 and a
+> **Status: experimental, "but playable."** Tested with Fallout 4 1.11.240 (Next-Gen, Steam), F4SE 0.7.9 and a
 > Meta Quest 3 through SteamVR (Steam Link) on an RTX 4070 Ti. See [docs/DEVLOG.md](docs/DEVLOG.md) for the
 > full development log (Finnish).
 
