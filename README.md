@@ -10,7 +10,7 @@ Play the regular (flat) **Fallout 4** in a **VR headset** with real stereo 3D, h
 
 | Feature | How |
 |---|---|
-| Stereo 3D in gameplay | The engine's own render camera is offset by Ãƒâ€šÃ‚Â±IPD/2 per frame, so shadows, glass, lighting and effects stay correct |
+| Stereo 3D in gameplay | The engine's own render camera is offset by ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±IPD/2 per frame, so shadows, glass, lighting and effects stay correct |
 | Output to the headset | Each frame goes to the matching eye texture and both eyes are submitted to SteamVR (OpenVR) |
 | Head rotation (and position) | HMD pose from SteamVR is applied to the game's camera |
 | Menus, intro, loading, Pip-Boy, VATS, dialogue | Shown on a virtual 2D screen in VR |
@@ -85,7 +85,7 @@ cmake --build plugin/b
 ## Configuration (`fo4stereo.ini`)
 
 The most-used settings can also be changed in-game through the **Mod Configuration Menu** (requires the
-[MCM](https://www.nexusmods.com/fallout4/mods/21497) mod): pause menu ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ *Mod Config* ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ *F4 Flat 2 VR*.
+[MCM](https://www.nexusmods.com/fallout4/mods/21497) mod): pause menu ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ *Mod Config* ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ *F4 Flat 2 VR*.
 Stereo settings apply immediately; the VR settings are pushed to the proxy through shared memory. Menu
 files live in `Data\MCM\Config\F4Flat2VR\` (`mcm/` in the repo, deploy with `deploy_mcm.ps1`); the MCM
 stores your changes in `Data\MCM\Settings\F4Flat2VR.ini`.
@@ -93,7 +93,7 @@ stores your changes in `Data\MCM\Settings\F4Flat2VR.ini`.
 | Section | Key | Meaning |
 |---|---|---|
 | `[engine]` | `enabled`, `mode=stereo\|wobble` | Eye offset on the engine camera. `wobble` is a sideways sway test. |
-| | `ipd_units` | Eye distance in game units. 4.48 = 64 mm (1 unit ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  1.43 cm). |
+| | `ipd_units` | Eye distance in game units. 4.48 = 64 mm (1 unit ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€¹Ã¢â‚¬Â  1.43 cm). |
 | | `compensate=4` | Eye offset method: 4 = render-camera node (works). 1 and 3 are older experiments. |
 | | `head_rotation` (0/1/2), `head_rot_compensate`, `head_position`, `units_per_meter` | Head tracking |
 | | `aim_ipd_scale` | Eye separation while aiming (0 = mono) |
@@ -120,7 +120,8 @@ stores your changes in `Data\MCM\Settings\F4Flat2VR.ini`.
 | [CommonLibF4](https://github.com/Ryan-rsm-McKenzie/CommonLibF4) by Ryan McKenzie | Git submodule, with a small patch for MSVC 14.44 (`patches/`) | MIT |
 | [OpenVR](https://github.com/ValveSoftware/openvr) header `openvr.h` by Valve | Included unchanged in `proxy/external/openvr/` | BSD 3-Clause |
 | F4SE `PluginAPI.h` | The `F4SEPluginVersionData` struct layout is reproduced in `plugin/src/main.cpp` so F4SE 0.7.x loads the plugin | F4SE's own terms |
-| [FRIK, Fallout 4 VR Body](https://github.com/rollingrock/Fallout-4-VR-Body) | **No code copied.** Its source was read as a reference for how the VR game handles the camera root node. | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â |
+| [FRIK, Fallout 4 VR Body](https://github.com/rollingrock/Fallout-4-VR-Body) | **No code copied.** Its source was read as a reference for how the VR game handles the camera root node. | ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â |
+| [Cline](https://cline.bot) (Anthropic) | AI pair programmer - code fixes, documentation, FOMOD packaging, debugging | - |
 
 All other code in `plugin/src` and `proxy/src` was written for this project. Details are in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
