@@ -1,5 +1,10 @@
 # How to Create a FOMOD Mod Package (Vortex/MO2 compatible)
 
+**In this repo, just run:** `powershell -ExecutionPolicy Bypass -File package_fomod.ps1`
+It builds `dist\F4_Flat_2_VR_<version>.zip` from the current builds, including the
+FOMOD XML files and the Vortex override instructions below. The guide explains
+what the script does.
+
 ## Overview
 
 A FOMOD package is a ZIP file that contains:
@@ -25,11 +30,6 @@ staging/
     ├── F4SE/
     │   └── Plugins/
     │       └── fo4flat_probe.dll    → goes to Data/F4SE/Plugins/
-    └── MCM/
-        └── Config/
-            └── F4Flat2VR/
-                ├── config.json      → goes to Data/MCM/Config/F4Flat2VR/
-                └── settings.ini     → goes to Data/MCM/Config/F4Flat2VR/
 ```
 
 ### 2. Create info.xml
@@ -54,8 +54,6 @@ staging/
     <file source="files\d3d11.dll" destination="" />
     <file source="files\fo4stereo.ini" destination="" />
     <file source="files\F4SE\Plugins\fo4flat_probe.dll" destination="Data\F4SE\Plugins" />
-    <file source="files\MCM\Config\F4Flat2VR\config.json" destination="Data\MCM\Config\F4Flat2VR" />
-    <file source="files\MCM\Config\F4Flat2VR\settings.ini" destination="Data\MCM\Config\F4Flat2VR" />
   </requiredInstallFiles>
 </config>
 ```
@@ -132,5 +130,3 @@ Where `<root>` is the folder containing `fomod/` and `files/`.
 | `files/d3d11.dll` | `Fallout 4\d3d11.dll` |
 | `files/fo4stereo.ini` | `Fallout 4\fo4stereo.ini` |
 | `files/F4SE/Plugins/fo4flat_probe.dll` | `Fallout 4\Data\F4SE\Plugins\fo4flat_probe.dll` |
-| `files/MCM/Config/F4Flat2VR/config.json` | `Fallout 4\Data\MCM\Config\F4Flat2VR\config.json` |
-| `files/MCM/Config/F4Flat2VR/settings.ini` | `Fallout 4\Data\MCM\Config\F4Flat2VR\settings.ini` |

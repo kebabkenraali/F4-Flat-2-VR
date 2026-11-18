@@ -23,13 +23,13 @@ Grab the latest release from the [Releases page](https://github.com/kebabkenraal
 | First and third person | Rendered in VR |
 | Any SteamVR headset | FOV measured at start, per-eye crop applied, window size and FOV written automatically |
 | FSR1 upscale | Non-temporal spatial upscale to headset resolution (VR-safe) |
-| MCM settings menu | In-game settings via pause > Mod Config (requires MCM mod) |
+| Configuration | `fo4stereo.ini` only; no MCM overrides or hidden live tuning |
 
 ## Known issues
 
 | Issue | Workaround |
 |---|---|
-| Aiming double vision | Check `fo4stereo_proxy.log` for `vr: zoom=1` when aiming. If zoom stays 0, lower `aim_ratio` in `fo4stereo.ini` |
+| Aiming double vision | Still needs an in-game retest. RenderDoc capture is temporarily blocked: the current launch path crashed before saving an `.rdc` file. Do not retry until Steam Overlay/RenderDoc interaction has been isolated; see `docs/DEVLOG.md`. |
 | Camera slightly off-centre | Set `convergence_m=0` in `fo4stereo.ini` to disable toe-in yaw |
 | Power armor exit animation stuck | Vanilla FO4 bug. Console: `player.moveto player` |
 | Alternate-frame stereo | Each eye gets half the frame rate (inherent to current design) |
@@ -48,18 +48,15 @@ Grab the latest release from the [Releases page](https://github.com/kebabkenraal
 | SteamVR | any | [Steam](https://store.steampowered.com/app/250820/SteamVR/) |
 | PC VR headset | any SteamVR-compatible | e.g. Meta Quest 3 via Steam Link |
 
-### Optional (in-game settings menu)
-
-| Dependency | Version | Link |
-|---|---|---|
-| MCM (Mod Configuration Menu) | 21497 | [Nexus Mods 21497](https://www.nexusmods.com/fallout4/mods/21497) |
-| MCM Settings Manager | 56195 | [Nexus Mods 56195](https://www.nexusmods.com/fallout4/mods/56195) |
-
-Without MCM, settings are edited manually in `fo4stereo.ini`.
+All settings are edited manually in `fo4stereo.ini`. Changes are read at game or proxy startup; restart the game after changing them.
 
 ### To build from source
 
-Visual Studio 2022 Build Tools (MSVC v143), CMake, Ninja and [vcpkg](https://github.com/microsoft/vcpkg).
+Visual Studio 2022 Build Tools (MSVC v143), CMake, Ninja and [vcpkg](https://github.com/microsoft/vcpkg). RenderDoc's `renderdoc_app.h` is optional at build time; when available from a RenderDoc installation, it enables the in-game F11 capture API.
+
+### Capturing a RenderDoc frame
+
+The F11 capture workflow is implemented, but is currently **not safe to run**: the latest attempt crashed Fallout 4 before producing a capture. The crash stack contains both `gameoverlayrenderer64.dll` and RenderDoc/DXGI calls even though the per-game Steam Overlay setting was reported disabled. This does not prove which module caused the crash. See `docs/DEVLOG.md` for the dump path and next diagnostic steps. Do not run `capture_renderdoc.ps1` again until the overlay interaction has been isolated.
 
 ## How it works
 
@@ -96,16 +93,19 @@ Deploy: copy `d3d11.dll` next to `Fallout4.exe` and `fo4flat_probe.dll` into `Da
 
 ## Configuration
 
-All settings live in `fo4stereo.ini` next to `Fallout4.exe`. The most-used settings can also be changed in-game through the **Mod Configuration Menu** (requires the [MCM](https://www.nexusmods.com/fallout4/mods/21497) mod): pause menu > Mod Config > F4 Flat 2 VR. Stereo settings apply immediately; VR settings are pushed to the proxy through shared memory.
+All runtime settings come from `fo4stereo.ini` next to `Fallout4.exe`; there is no MCM reader or second settings file. For ADS debugging, keep `aim_ipd_scale=0` unless a specific camera-position test calls for changing it: this offset changes framing, not whether the image is mono or stereo.
 
 | Section | Key | Purpose |
 |---|---|---|
-| `[engine]` | `enabled`, `mode`, `ipd_units` | Engine-camera stereo: on/off, `stereo` / `wobble`, eye separation in game units (4.48 = 64 mm) |
-| | `compensate`, `head_rotation`, `head_rot_compensate`, `head_position`, `units_per_meter`, `convergence_m`, `aim_ipd_scale` | Eye offset method; HMD rotation (0/1/2) and 6DoF; convergence distance; mono offset while aiming |
+| `[engine]` | `enabled`, `mode`, `ipd_units`, `use_runtime_ipd` | Engine-camera stereo: on/off, `stereo` / `wobble`, manual eye separation in game units (4.48 = 64 mm), or headset IPD when available |
+| | `compensate`, `head_rotation`, `head_rot_compensate`, `head_position`, `units_per_meter`, `convergence_m`, `aim_ipd_scale` | Eye offset method; HMD rotation (0/1/2) and 6DoF; convergence distance; signed ADS camera-framing offset (0 = no extra offset) |
 | `[vr]` | `enabled`, `eye_delay`, `swap_eyes`, `wait_poses` | Submit to SteamVR; eye timing; eye swap |
 | | `flat_after_frames`, `screen_width_m`, `screen_distance_m` | Menus after N frames without camera updates; 2D screen size and distance in metres |
 | | `fov_bounds`, `no_vsync`, `auto_configure` | Per-eye crop and automatic window size and FOV |
+| | `capture_aim_frames` | When 1, automatically save left/right BMP pairs for first-person hipfire and ADS; disabled by default |
+| | `renderdoc_capture_key` | Virtual-key code for one-frame RenderDoc captures; default 122 (F11), requires launching via `capture_renderdoc.ps1`; 0 disables |
 | | `aim_ratio`, `pipboy_ratio`, `pipboy_2d`, `other_cams_2d`, `vr_cam_states` | Zoom detection, and which camera states are shown in VR (0 first person, 7 third person) |
+| | `hud_panels`, `hud_mask`, `hud_bg_alpha`, `hud_*_crop`, `hud_*_yaw_deg`, `hud_*_pitch_deg`, `hud_*_width_m` | HP, ammo and compass drawn as head-locked panels; the game HUD is masked out of the world. Needs `fHUDOpacity=1` in Fallout4Prefs.ini. Numpad 5 opens the on-screen tuning mode |
 | | `upscale`, `upscale_sharpness` | FSR1 spatial upscale (non-temporal, VR-safe) |
 | | `pipboy_projected`, `pipboy_target_index`, `pipboy_screen_width_m`, `pipboy_screen_distance_m`, `pipboy_screen_height_m` | Pip-Boy 2D overlay size and position |
 | `[stereo]` | `enabled=0` | Old D3D matrix-patching experiment. Keep it off. |
@@ -138,3 +138,19 @@ All other code in `plugin/src` and `proxy/src` was written for this project. Det
 [MIT](LICENSE). You may use, modify and share this project for any purpose, including commercially, as long as you keep the license notice and **credit kebabkenraali** as the source.
 
 This project contains no game files and is not affiliated with or endorsed by Bethesda Softworks or ZeniMax Media. Fallout is a trademark of ZeniMax Media.
+
+## HUD and in-game tuning (18.11.2026)
+
+- **HUD frame:** the area inside which all HUD elements must fit is set by four screen edges in degrees
+  from the view centre: `hud_frame_left_deg`, `hud_frame_right_deg`, `hud_frame_top_deg`, `hud_frame_bottom_deg`
+  (defaults -50, 50, 20, -30). Elements are placed inside the frame using their normalised positions
+  (`hud_<name>_fx`, `hud_<name>_fy`) and kept inside the edges.
+- **Tuning mode (Numpad 5):** Numpad 7 switches between frame, element and crop modes. In frame mode
+  Numpad 4/6/8/2 move the frame edges, Numpad 1/9 select, Numpad 3 toggles the element. Numpad +/- zoom the
+  whole HUD, Numpad 0 saves the frame edges and element positions to the settings file.
+- **MCM:** `mo2/F4Flat2VR_Dev/MCM` contains the MCM page configuration (HUD frame, dialogue panel and
+  general settings). The MCM settings file `Data\MCM\Settings\F4Flat2VR.ini` overrides values from `fo4stereo.ini`.
+- **HUD file:** `tools/hud/` extracts the game's `HUDMenu.swf` from your own installation (read only),
+  reports element positions (`swf_layout.py`), and fits the HUD into the frame (`swf_fit.py`).
+  Bethesda's files are not included in this repository.
+- No third-party UI mods are required. Two mods that replace `HUDMenu.swf` cannot be active at the same time.

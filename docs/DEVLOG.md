@@ -1,6 +1,33 @@
 # Status: Fallout 4 flat -> VR (stereo + gamepad)
 
-Päivitetty: 2026-11-13
+Päivitetty: 2026-11-15
+
+## Nykytilanne: tähtäys ja MCM:n poistaminen (15.11.2026)
+
+### MCM on arkistoitu
+
+- MCM:n valikkotiedostot, käyttäjäasetukset ja käyttöönoton apuskripti on siirretty arkistoon. Plugin ja proxy eivät enää lue MCM-tiedostoja; asetusten lähde on `fo4stereo.ini`.
+- Jaetun muistin asetuspuskuri poistettiin ja nimi nostettiin v4:ään, jotta vanha v3/MCM-prosessi ei voi sekoittua uuden pluginin ja proxyn välille.
+- Pelikansion F4Flat2VR-kohtaiset MCM-tiedostot ja niiden varmuuskopiot sekä vanhat DLL:t ja INI varastoitiin `archive/retired-mcm/game-install-20261115/`-kansioon. Aktiivisesta `fo4stereo.ini`:stä säilytettiin muut asetukset; MCM:n käytössä ollut `bEyeDelay=1` siirrettiin `eye_delay=1`:ksi ja ADS-offset jätettiin neutraaliin arvoon `aim_ipd_scale=0`.
+- MCM-vapaat DLL:t käännettiin, asennettiin ja SHA-256-tarkistettiin. FOMOD 0.3 rakennettiin ja tarkistettiin: paketissa ei ole MCM-tiedostoja ja molemmat XML-tiedostot ovat kelvollisia.
+- Alla olevat MCM-merkinnät ovat kehityshistoriaa, eivät nykyisen version toimintoja. Aiempi väite CyberpunkVR:n vasen/keskellä/oikea MCM-silmävalinnasta oli virheellinen.
+
+### Mitä vertailuprojekteista voidaan oikeasti päätellä
+
+- [CyberpunkVR Portin `EngineStereo.cpp`](https://github.com/dariulone/cyberpunk-vr-port/blob/main/src/Stereo/EngineStereo.cpp) pyytää moottorilta oikeat vasemman ja oikean silmän kamerat, käyttää headsetin IPD:tä ja rinnakkaista konvergenssia. Se ei ole sama toteutus kuin tämän projektin vuorottelevat renderöintikehykset.
+- [CyberpunkVR Portin `AdsEyeAlign.cpp`](https://github.com/dariulone/cyberpunk-vr-port/blob/main/src/Anim/AdsEyeAlign.cpp) kohdistaa ADS-animaation aseen ja käsivarsien poseerausta sighting-eye-silmään cyclopean-kamerakeskuksen sijasta. Tavallinen ase käyttää oikeaa silmää; vasempaan käteen siirretty ase vasenta. Tämä ei ole yleinen vasen/keskellä/oikea-kuva-asetus, eikä se siirrä koko maailmakameraa. Oppi on muokata aseen poseerausta, jos ase on ainoa väärässä kohdassa; se ei yksin korjaa taustan tuplautumista.
+- [UEVR:n README](https://github.com/praydog/UEVR/blob/master/README.md) erottaa Native Stereo-, Synchronized Sequential- ja AFR-renderöinnin. UEVR:n `Aim Method` valitsee tähtäyksen suunnan lähteen (peli, pää tai ohjain), ei dominoivaa silmää. Synchronized Sequential on hyödyllinen vertailukohta, koska silmät renderöidään samalla pelitickillä; sen TAA voi silti haamuttaa.
+- `D:\\Fallout 4 VR\\src` sisältää F4SE/OpenVR-rajapintoja ja työkaluja, ei Bethesda-pelin kameran tai ADS:n lähdekoodia. `Fallout4VR.exe` on käännetty moottori, joten tarkkaa sisäistä tähtäystoteutusta ei voi vahvistaa puretuista peliresursseista. Dokumentaatio ei siksi väitä, että Fallout 4 VR käyttäisi samaa ADS-korjausta kuin CyberpunkVR.
+
+### Tämän projektin näyttö ja seuraava tekninen askel
+
+- 15.11. ADS-loki vahvisti `zoom=1`, kamera-tilan 0 ja pluginissa `aimFp=1`, `shift=0`. Molempien silmien `Submit` palautti onnistumisen ja käytti samoja rajauksia, mutta myös samaa D3D-tekstuuriresurssia. Käyttäjän havainto tarkentui: vasemmalle sijoittunut kaksoiskuva näyttää aseen kokonaan, oikealle sijoittuneesta puuttuu noin sentti aseen vasemmasta reunasta.
+- Proxy kopioi jo uusimman kuvan molempiin silmätekstuuripintoihin, mutta lähetti silti saman tekstuuriosoitteen molemmille `Submit`-kutsuille. Korjaus käyttää nyt erillistä silmätekstuuria kummassakin kutsussa; niiden pitäisi sisältää sama kaapattu kuva. Uusi 0.3.1-paketti ja pelibinaari on rakennettu. ADS-testi tarvitaan ennen kuin voidaan päätellä, poistuiko kaksoiskuva; jos ei, seuraavaksi kaapataan tekstuurin sisältö ennen Submitia.
+- RenderDocin attach-ongelman kiertämiseksi lisättiin `[vr] capture_aim_frames=1`: ensimmäisen persoonan hipfire- ja ADS-tiloista tallentuu automaattisesti yksi vasen/oikea BMP-pari pelin juureen 12 vakaan Presentin jälkeen. Oletus on 0; nykyinen pelikansion INI asetetaan testin ajaksi arvoon 1. Kolmannen persoonan kuva on tarkoituksella 2D (`vr_cam_states=0`), joten se ei tuota stereovertailukaappausta.
+- 15.11. Lisättiin RenderDocin in-process API -kaappaus: F11 tallentaa seuraavan D3D11-kehyksen `.rdc`-tiedostoksi, otsikoituna hipfire/ADS-tilan mukaan ja pelikansion `fo4stereo_renderdoc`-hakemistoon. Myöhäinen `renderdoccmd inject --PID` latasi RenderDoc-moduulin, mutta capture API ei käynnistynyt jo luodulla D3D11-laitteella. `capture_renderdoc.ps1` käynnistää nyt F4SE-loaderin RenderDocin `capture`-komennon alla lapsiprosessien hookkauksella ja tarkistaa, että `renderdoc.dll` latautui varsinaiseen `Fallout4.exe`:hen. RenderDocin API-otsake haetaan asennuksesta CMake-vaiheessa; DLL:ää ei linkitetä tai paketoida modin mukana.
+- F11-testi vahvisti API:n latauksen, mutta jälki-injektoinnissa tarkka ja wildcard D3D11-laite/ikkuna-pari eivät käynnistäneet capturea. Lisättiin `SetActiveWindow` ja dokumentoitu wildcard (`NULL, NULL`) -varayritys; EndFrameCapture käyttää vastaavaa pariargumenttia. Uusi käynnistysreitti odottaa D3D11-laitteen alustusta ennen kuin F11-testiä jatketaan.
+- 15.11.2026: RenderDocin pre-launch-yritys kaatoi pelin ennen kaappauksen valmistumista; `.rdc`-tiedostoja ei syntynyt. Dump analysoitiin paikallisesti WinDbgissä (`C:\Users\mipoi\AppData\Local\CrashDumps\Fallout4.exe.23228.dmp`). Poikkeus oli käyttöoikeusvirhe (`0xc0000005`) KERNELBASE-polussa; pino sisältää toistuvia `gameoverlayrenderer64.dll`-kutsuja sekä RenderDocin `RENDERDOC_CheckRemoteServerConnection`- ja DXGI-alustuskehyksiä. Steam Overlay oli käyttäjän mukaan poistettu käytöstä, mutta DLL oli silti ladattu. Tämä on näyttö moduulien yhteisesiintymisestä kaatumispinossa, ei varma todiste yksittäisestä syyllisestä.
+- **Jatko koneen uudelleenkäynnistyksen jälkeen:** älä käynnistä peliä RenderDocin kautta ennen kuin Steam Overlayn ja RenderDocin yhteensopivuus on eristetty. Tarkista ensin, että peli ei käynnisty taustalla ja että Steam-overlayn tila on yhä pois päältä; selvitä sitten, miksi overlay-DLL latautuu. Tee seuraava testi vain hallitulla tavalla ja yksi muutos kerrallaan. RenderDoc-kaappauksia ei toistaiseksi ole.
 
 ## Tavoite
 
@@ -57,11 +84,10 @@ Lisäoppija (luettu reposton ajantasaisesta README:stä 13.11.2026), suoraan sov
 - **Proxy lukee MCM-tiedoston nyt suoraan** (`Data\MCM\Settings\F4Flat2VR.ini`, mtime-portti, `VrApplyMcm`
   Presentissä) — varmempi polku, joka ei ole riippuvainen pluginin shm-puskusta. Molemmat polut soveltavat
   samat arvot.
-- **Dominantti silmä (uusi asetus):** MCM Stereo-sivu *Dominantti silmä* (keskellä/vasen/oikea). Kun tähdätään
-  mono-tilassa (`fAimIpdScale=0`), kamera siirtyy dominantin silmän paikalle — tähtäysnäkymä vastaa silmää jolla
-  tähtäämä tapahtuu, eikä konvergenssin kääntö nytkähdä (etumerkki sidottu siirtymän suuntaan, ei vuorottelevaan
-  silmään). Pistoolin tuplakuvien syy: täysi stereo lähietäisyydellä (aim_ipd_scale=1) + konvergenssivirhe;
-  mono + dominantti silmä on oikea ratkaisu.
+- **Dominantti silmä (MCM-kokeilu; päätelmä korjattu 15.11):** tuolloin lisättiin vasen/keskellä/oikea-valinta
+  ja oletettiin sen olevan sama lähestymistapa kuin CyberpunkVR:ssä. Lähdekoodin tarkistus osoitti tämän
+  oletuksen vääräksi: CyberpunkVR siirtää ADS-asetta/käsivarsia tähtäävän silmän mukaan, ei koko kameraa.
+  Kokeilu ja sen asetukset on arkistoitu; koko kuvan tuplautumista tämä kameraoffset ei ratkaise.
 - MCM-käyttäjäasetukset palautettu järkeviin arvoihin (`fIPDUnits=4.48`, `fConvergeM=1.5`, `bEyeDelay=1`,
   `iDominantEye=2`): edellisen testin lopussa IPD oli jäänyt 0:aan (stereo pois).
 - Molemmat DLL:t käännetty ja asennettu, MCM-valikkotiedostot päivitetty peliin.
@@ -284,7 +310,7 @@ Lisäoppija (luettu reposton ajantasaisesta README:stä 13.11.2026), suoraan sov
   lähettää ne OpenVR:n kautta Quest 3:een. Silmän valinta pitää synkronoida pluginin ja proxyn välillä.
 - **Stereo v1 (11.11.2026 klo ~21.45, ei vielä testattu):** plugin vaihtaa silmää jokaisessa kameratilan
   Updatessa (0x0B) ja siirtää kameraa ±ipd/2 (`[engine] mode=stereo`, `ipd_units=4.48` = 64 mm). Silmä
-  kirjoitetaan jaettuun muistiin (`fo4stereo/src/stereo_shm.h`, `Localo4stereo_shm_v1`). Proxy lataa
+  kirjoitetaan jaettuun muistiin (`fo4stereo/src/stereo_shm.h`, `Local\fo4stereo_shm_v1`). Proxy lataa
   `openvr_api.dll`:n (SteamVR, dynaamisesti), käynnistää OpenVR:n Scene-sovelluksena, kopioi jokaisen Presentin
   takapuskurin silmän tekstuuriin ja lähettää molemmat silmät (`IVRCompositor_029`: WaitGetPoses, Submit,
   PostPresentHandoff). Asetukset `[vr]`: enabled, eye_delay (0/1), swap_eyes, wait_poses. OpenVR-otsake:
@@ -306,7 +332,7 @@ Lisäoppija (luettu reposton ajantasaisesta README:stä 13.11.2026), suoraan sov
   alkuperäinen GetTranslation palauttaa paikan, jossa edellisen kehyksen siirto on jo mukana
   (wobble: out ≈ shift_n + shift_{n-1}; stereo: shift −2.24 → out 0). Vuorottelevat ±IPD/2 kumoavat toisensa.
 - **Stereo v2 (22.25, asennettu, ei testattu):**
-  - Jaettu muisti v2 (`Localo4stereo_shm_v2`): eye, seq, presents, flatMode, HMD-asento seqlockilla.
+  - Jaettu muisti v2 (`Local\fo4stereo_shm_v2`): eye, seq, presents, flatMode, HMD-asento seqlockilla.
   - **Proxy omistaa silmän:** kehyksen silmä = (Present-määrä ennen tätä − eye_delay) & 1. Plugin lukee saman
     laskurin state-Updatessa.
   - **Kompensointi:** GetTranslation palauttaa `orig − prevApplied + curApplied` (`[engine] compensate=1`).
@@ -315,7 +341,7 @@ Lisäoppija (luettu reposton ajantasaisesta README:stä 13.11.2026), suoraan sov
   - **Pään seuranta:** proxy kirjoittaa WaitGetPoses-asennon (HMD, istuma-avaruus). Plugin koukuttaa kameratilan
     GetRotationin (0x0C) ja yhdistää pään kierron (VR → peli: q = (w, x, −z, y), `head_rotation` 1/2,
     `head_rot_compensate`). Pään paikka lisätään siirtoon (`head_position`, `units_per_meter=70`).
-  - Varmuuskopiot: `d3d11_vr_v1.dll.bak`, `Data\F4SEo4flat_probe_stereo1.dll.bak`, `fo4stereo.ini.bak_v1`,
+  - Varmuuskopiot: `d3d11_vr_v1.dll.bak`, `Data\F4SE\fo4flat_probe_stereo1.dll.bak`, `fo4stereo.ini.bak_v1`,
     `proxy.cpp.bak_vr1`, `main.cpp.bak_stereo1`.
 - **Stereo v2 -testi 22.28:** VR ei käynnistynyt: `VRInitError_Init_HmdNotFound` (108), koska kypärä ei ollut
   yhteydessä SteamVR:ään pelin käynnistyessä. Siksi 2D-ruutua ja pään seurantaa ei testattu (`pose=false`).
@@ -371,7 +397,7 @@ Lisäoppija (luettu reposton ajantasaisesta README:stä 13.11.2026), suoraan sov
   siirron täysin. **Uusi tapa `compensate=4` (23.05):** silmä- ja pääsiirto asetetaan cameraRootin lapsisolmun
   (renderöintikamera, nimi lokissa) local.translate-arvoon kameran paikallisissa akseleissa. Kameratila ei lue
   lasta, joten palautetta ei tule. GetTranslationia ei muuteta. Ei vielä testattu. Varmuuskopiot `main.cpp.bak_v3`,
-  `Data\F4SEo4flat_probe_v3.dll.bak`, `fo4stereo.ini.bak_v4`.
+  `Data\F4SE\fo4flat_probe_v3.dll.bak`, `fo4stereo.ini.bak_v4`.
 - **Käyttäjän havainnot (23.03-ajo, compensate=1, ipd 9):** "hieman kaksoiskuvaa esim. kun NPC on ihan vieressä;
   tähtääminen sekoittaa näkymän; kameran liikkeissä lagia; Pip-Boy pitäisi skaalata paremmin tai näyttää muuten kuin
   VR:ssä." Kaksoiskuva lähellä tarkoittaa, että silmät erosivat jonkin verran. Silmäväli oli kaksinkertainen (9).
@@ -476,3 +502,359 @@ Lisäoppija (luettu reposton ajantasaisesta README:stä 13.11.2026), suoraan sov
 - Instrumentation added: proxy logs vr: eye N bounds..., plugin logs aim{} conv yaw....
 - Build & deploy: d3d11.dll and fo4flat_probe.dll deployed.
 
+
+## New fixes (15.11.2026)
+
+- Aiming double vision remains unresolved. The mono-aim path selects one captured eye texture for both eye submissions when available, but this did not prove what the compositor displayed and the user still reported both weapon and background doubled. The new transition logs record each actual `Submit` call separately; compare those with hipfire before changing camera math.
+- Camera looks down-left: likely cause is OpenVR seated zero pose, which resets position and yaw but NOT pitch. Added [vr] `head_yaw_offset_deg`, `head_pitch_offset_deg` and `recenter_key` (default F9=120) to fo4stereo.ini. Recenter captures the current head yaw+pitch as offsets, applied to the pose written to shm and to the 2D screen transform (screen follows the new zero pose).
+- Plugin log spam: conv yaw logged every frame because the sign alternates per eye; now logs on magnitude change only.
+- Both binaries rebuilt and deployed to the game directory.
+
+## Double rendering analysis (15.11.2026)
+
+Measured from the plugin log (03:14:49-03:14:54, 5 s window):
+
+- getTrans calls: 600 -> 120/s
+- state updates (HookedStateUpdate): 300 -> 60/s
+- presents: 300 -> 60/s
+
+Interpretation: the engine calls getTrans TWICE per present, while the camera state
+updates once per game tick. The current eye alternation is per TICK, so the per-eye
+rate is present_rate / 2 = 30 Hz with the engine's 60 fps cap.
+
+Options for double rendering (higher per-eye rate / both eyes per frame):
+
+1. **Unlock the engine cap** (iPresentInterval=0): if presents rise above 60, per-eye
+   rate rises proportionally IF alternation follows the renders. Risk: alternation is
+   per tick, so presents between ticks repeat an eye (L,L,R,R) - new content per eye
+   stays at tick rate. Instrumentation needed: what hook runs once per RENDERED frame?
+2. **Per-render eye alternation**: if a hook that runs once per render (getTrans is 2x,
+   so not 1:1) can apply the eye offset, alternation could follow renders instead of
+   ticks. Requires identifying the true per-render camera read on the render thread.
+3. **Proxy-side reprojection**: render the game frame, capture the depth buffer, and
+   reproject it for the other eye. No engine changes, but GPU cost and edge artifacts.
+
+First experiment: unlock iPresentInterval and watch whether presents in the getTrans
+log lines exceeds 60/s and whether getTrans stays at 2x (structural) or becomes 1:1.
+
+## Aim / camera investigation (15.11.2026)
+
+How the engine changes the camera when aiming (ADS), from code + logs:
+
+- FO4 does NOT switch camera states on ADS: the IronSights state (id 4) exists in
+  the CameraStates enum, but the logs show camState stays 0 in first person.
+- ADS is a FOV zoom only: the weapon's AimModel narrows the projection. The proxy
+  measures game tan 1.307 vs normal 1.377 -> ratio 0.950 (about a 5% zoom).
+- The camera position/rotation itself is not offset by the engine on ADS.
+
+Consequence: aim detection was a present-time FOV-ratio heuristic with a one-frame
+round-trip (plugin reads shm->zoom written by the proxy at the last Present), and
+heavy scope zoom would cross pipboy_ratio (0.75) and flip the view to the 2D screen.
+
+New implementation:
+- Plugin reads PlayerCamera::fovAdjustCurrent + pipboyMode directly (g_cam is
+  already hooked) -> per-tick, zero-lag aim detection (aimFov = fovAdj < 0.999).
+- New shm field aim (was pad2): plugin publishes the engine aim flag.
+- Proxy: pluginAim overrides the ratio heuristic for zoom=1 (first person only);
+  the Pip-Boy projected-target check still wins, so the Pip-Boy stays on the 2D
+  screen while scopes stay in VR mono aim.
+- MCM settings.ini aligned with fo4stereo.ini (ini is the source of truth):
+  fAimIpdScale=0, fConvergeM=1.5, bEyeDelay=1, fUpSharp=0.1, fScreenDist=2.0,
+  fPipWidth=0.8.
+- Both binaries rebuilt and deployed; FOMOD zip rebuilt (0.2).
+
+---
+
+## Oppianalyysi: CyberpunkVR Port + UEVR + Oblivion UEVR Profile (15.11.2026)
+
+---
+
+### Yhdistetty suunnitelma: Mitä lainaamme kummastakin
+
+| Alue | CyberpunkVR | UEVR / Oblivion Profiili | Meidän toimitehdas |
+|------|-------------|--------------------------|-------------------|
+| **Stereo-tilat** | Engine-native stereo + VRCAM fallback | Native / Sequential / AFR (valittava live) | **Lisää Synchronized Sequential** (kaksi framea samalla tickillä) + AFR + valinta in-game GUI:ssa |
+| **Head tracking** | OpenXR, runtime IPD, world scale | UEVR abstraktoi OpenVR/OpenXR | **Runtime IPD** (OpenVR `Prop_UserIpdMeters_Float`), **World Scale** (yhden skaalauksen kerroin) |
+| **Mono-aim** | EngineStereo mono = pään keskipiste | 3DOF motion controls | **Mono-aim = pään keskipiste**, dominant-silmä slider hienosäätö |
+| **UI-käsittely** | Native VR-HUD paneelit | Automaattinen UI-projektointi 3D:een + UI Follow View | **Pip-Boy/terminat/container UI → 3D-projektointi** mukavaan syvyyteen, UI Follow View -tila |
+| **In-game säädöt** | Debug-exportit (`CyberpunkVR_Debug*`) | ImGui-overlay (Insert/L3+R3), RT+stick shortcuts | **ImGui-overlay Insert-näppäimellä**: live IPD, convergence, camera offset, recenter, stereo mode, standing origin |
+| **Motion controls** | Ei (vain HMD) | Fyysinen combat, holsterit, gesture-hyökkäykset, asepyörä | **FRIK-integraatio**: collision-melee, block/parry, holster-järjestelmä, kaksinkertaiset aseet, favoritipyörä |
+| **Profiilit** | INI + MCM | Zip-profiilit (config + Lua + ESP) | **Profiilijärjestelmä (JSON)**: export/import, per-ase/per-tilanne, community-jakelu |
+| **Injection/Launcher** | Ei (RED4ext) | UEVRInjector.exe (pre-flight checks, VR-plugin nullification) | **Launcher/Injector**: konfliktitarkistus, DLL-backup, uninstall-palautus, admin-check |
+| **GPU-optimoinnit** | Piilomaski, FFR/VRS, jaetut varjot, exposure ympäristöstä | Skip Draw / Skip Tick variantit | **Piilomaski linssireunoille**, **VRS/FFR**, **per-silmä depth submit**, **exposure ympäristöstä** |
+| **Debug/Telemetria** | `CyberpunkVR_Debug*` globaalit | UEVR Debug-loki | **`fo4flat_Debug*` exportit** + per-frame loki toggle |
+---
+
+## Prioriteettilista (Päivitetty 15.11.2026)
+
+### Vaihe 1: Core UX & Rendering (Viikko 1-2) — **KORKOINEN VAIKUTUS**
+| # | Ominaisuus | Lähde | Vaikeus | Vaikutus |
+|---|------------|-------|---------|----------|
+| 1 | **Synchronized Sequential -tila** | UEVR | Korkea | ⭐⭐⭐⭐⭐ — Korjaa tuplakuvan ilman proxy-hakkia, game time ei advance välissä |
+| 2 | **In-game ImGui-overlay (Insert-näppäin)** | UEVR | Keskitaso | ⭐⭐⭐⭐⭐ — Live IPD, convergence, camera offset, recenter, stereo mode, standing origin |
+| 3 | **Runtime IPD OpenVR:stä** | CyberpunkVR | Matala | ⭐⭐⭐⭐ — Nollaa kalibroinnin, toimii joka käyttäjälle |
+| 4 | **World Scale -kerroin** | CyberpunkVR | Matala | ⭐⭐⭐⭐ — Yhden sliderin "maailman koko" (IPD + head pos) |
+| 5 | **Standing Origin -järjestelmä** | UEVR | Keskitaso | ⭐⭐⭐⭐ — Erottaa lattiakalibraation kamera-fine-tuningista |
+| 6 | **Mono-aim = pään keskipiste** | CyberpunkVR | Matala | ⭐⭐⭐⭐ — Luonnollisempi tähtäys, vähemmän silmäyliuistelu |
+
+### Vaihe 2: Motion Controls & Combat (Viikko 3-4) — **FRIK-INTEGRAATIO**
+| # | Ominaisuus | Lähde | Vaikeus | Vaikutus |
+|---|------------|-------|---------|----------|
+| 7 | **Collision-pohjainen melee** | Oblivion UEVR | Korkea | ⭐⭐⭐⭐⭐ — Lyönnin voima → damage tier, shield-block collision-normaalilla |
+| 8 | **Holster-järjestelmä (body-relative)** | Oblivion UEVR | Keskitaso | ⭐⭐⭐⭐ — Quickslotit ruumiin paikkoihin (olkapää, vyötärö, rintakehä) |
+| 9 | **Kaksoiskäsivyöt / kaksinkertaiset aseet** | Oblivion UEVR | Keskitaso | ⭐⭐⭐ — Molemmat controllerit samalla objektilla |
+| 10 | **Gesture-hyökkäykset + block/parry** | Oblivion UEVR | Korkea | ⭐⭐⭐⭐ — Swipe force → light/heavy; kilven kääntäminen vihun aseen suuntaan = parry |
+| 11 | **Favoritipyörä (Quickslot Wheel)** | Oblivion UEVR | Matala | ⭐⭐⭐ — Grip+tick → radiaalivalikko world-space |
+| 12 | **UI Follow View (Pip-Boy/terminat)** | Oblivion UEVR | Keskitaso | ⭐⭐⭐⭐ — UI seuraa päätä, head-aim väliaikaisesti |
+
+### Vaihe 3: Advanced Rendering & Polish (Kuukausi 2) — **LAADUN NOSTAMINEN**
+| # | Ominaisuus | Lähde | Vaikeus | Vaikutus |
+|---|------------|-------|---------|----------|
+| 13 | **Automaattinen UI-projektointi 3D:een** | UEVR | Korkea | ⭐⭐⭐⭐ — HUD/valikot mukavaan syvyyteen, luettava koko |
+| 14 | **Per-silmä depth submit (OpenVR)** | CyberpunkVR | Keskitaso | ⭐⭐⭐⭐ — ATW/reprojektiotehus paranee merkittävästi |
+| 15 | **Piilomaski linssireunoille + VRS/FFR** | CyberpunkVR | Keskitaso | ⭐⭐⭐ — GPU-säästö resoluutiorajoitteisessa |
+| 16 | **Profiilijärjestelmä (JSON export/import)** | UEVR | Keskitaso | ⭐⭐⭐ — Per-ase/per-tilanne, community-jakelu |
+| 17 | **Launcher/Injector pre-flight checks** | UEVR | Keskitaso | ⭐⭐⭐ — Konfliktitarkistus, DLL-backup, uninstall-palautus |
+| 18 | **Asymmetrinen projektio per silmä** | CyberpunkVR | Korkea | ⭐⭐⭐ — Linssikeskuksen mukainen frustum, vähemmän distorsiota |
+| 19 | **OSR (One-Side Reconstruction) tila** | CyberpunkVR | Korkea | ⭐⭐⭐⭐ — "Melkein natiivi" framerate, toinen silmä rekonstruoituna |
+Tässä päivitetään sisäinen suunnittelu dokumentaatio kattamaan molemmat viiteprojektit:
+[CyberpunkVR Port](https://github.com/dariulone/cyberpunk-vr-port) (RED4ext, OpenXR, engine-native stereo)
+### A. CyberpunkVR Port — RED4ext / OpenXR / Engine-native stereo
+
+**Perusperiaatteet (CameraMath.cpp + EngineStereo.cpp + SyncStereo.cpp):**
+- **Aito stereo, ei uudelleenprojisointia:** toinen silmä on oma moottorin render-kamera.
+- **AFW (Alternate Frame Warping):** silmät vuorottelevat kehyksissä, toinen silmä rekonstruoidaan edellisen kehyksen perusteella.
+- **Asymmetrinen projektio per silmä:** jokaisen silmän näkymä rajataan headsetin linssikentän mukaiseksi.
+- **OpenXR head tracking:** HMD-asento injektoidaan render-polkuihin, per-eye depth-kerrokset parantavat reprojektiota.
+- **Natiivinen VR-HUD:** HUD-elementit omille paneeleilleen, free-look-kartiot säädettävissä.
+- **FSR1 upscale:** ei-temporaalinen, VR-turvallinen.
+---
+
+## Tekniset velkakirjat — Miten nämä ratkaisut auttavat
+
+| Ongelma | Nykyinen tilanne | Ratkaisu uudella suunnitelmalla |
+|---------|------------------|--------------------------------|
+| **Tuplakuva ADS:llä liikuttaessa** | Proxy kopioi uusimman framen molempiin silmiin (hakk) | Synchronized Sequential: molemmat silmät SAMALLA tickillä → nollaa temporaaliset erot |
+| **Kamera "down-left" (pitch ei resettoidu)** | F9 recenter (F9 = quickload konfliktissa) | Standing Origin + Delete-näppäin recenter (yaw+pitch), Home = standing origin reset |
+| **Hiiren scroll vie sivulle** | Head position lasketaan kameran akselilla, ei pään | Head position rotattuu pään orientaatiolla (oikein toteutettu 15.11) |
+| **MCM ei näy / ei toimi** | Config-kansio puuttui, MCM.ini ei syntynyt | Deploy-skripti korjattu, profiilijärjestelmä varmistaa asetusten tallennuksen |
+| **Puolet frameraatesta (AFR)** | Silmät vuorottelevat kehyksissä | Synchronized Sequential (kaksi framea samalla tickillä) TAI OSR (rekonstruktio) |
+| **Konvergenssi kääntää mono-näkymän** | Toe-in yaw mono-tilassa | Mono-tilassa yaw = 0 (vain vuorotteleva stereo saa convergence) |
+| **IPD kovakoodattu** | `ipd_units=4.48` INI:ssä | Runtime IPD OpenVR:stä + World Scale -kerroin |
+| **Ei motion controls** | Pelkkä gamepad | FRIK-integraatio: collision-melee, holsterit, gesture-hyökkäykset |
+
+---
+
+## Arkkitehtuurin muutos: Modulaarinen Core
+
+```
+f4flat2vr/
+├── core/                    # Yhteinen logiikka (kamera, HMD, stereo-math)
+│   ├── CameraMath.hpp       # CyberpunkVR: FOV, IPD, basis-rakennus, world scale
+│   ├── PoseIdentity.hpp     # CyberpunkVR/UEVR: pose-fingerprinting, staleness detection
+│   ├── StereoMode.hpp       # UEVR: Native / Sequential / AFR / OSR enum + tilakone
+│   ├── WorldScale.hpp       # CyberpunkVR: yhtenäinen skaalaus IPD + head pos
+│   └── UIProjection.hpp     # UEVR: UI 3D-projektointi, Follow View
+├── plugin/                  # F4SE-plugin (moottorikamera, head tracking)
+│   ├── CameraHooks.cpp      # GetTranslation/GetRotation hookit
+│   ├── StereoController.cpp # Silmävuorottelu, offset-lasku, stereo-mode logiikka
+│   ├── HeadTracker.cpp      # OpenVR pose → moottorioordinaatisto
+│   ├── MotionController.cpp # FRIK: collision-melee, holsterit, gestureraw
+│   └── ProfileManager.cpp   # JSON profiilien luku/kirjoitus
+├── proxy/                   # D3D11-proxy (frame capture, OpenVR submit)
+│   ├── FrameCapture.cpp     # Present-hook, eye texture management
+│   ├── StereoSubmit.cpp     # OpenVR submit, per-silmä depth, AFW/OSR/Sequential
+│   ├── ImGuiOverlay.cpp     # UEVR: Insert-näppäin → live-säädöt
+│   ├── Reprojection.cpp     # CyberpunkVR: OSR depth+motion vector rekonstruktio
+│   └── HiddenAreaMask.cpp   # CyberpunkVR: linssipiilomaski
+├── launcher/                # UEVR: UEVRInjector.exe kaltainen
+│   ├── PreflightChecks.cpp  # Konfliktit, admin, overlayt, DLSS FG, GPU scheduling
+│   ├── DllBackup.cpp        # Varmuuskopioi DLL:t, uninstall-palautus
+│   └── ProfileDeploy.cpp    # JSON-profiilien asennus/päivitys
+└── mcm/                     # MCM-valikko (olemassa, säilyy)
+```
+## Toteutus: Runtime IPD + World Scale (15.11.2026)
+
+Suunnitelman Vaihe 1:n matalan riskin korkean vaikutuksen kohteet toteutettu.
+
+### Runtime IPD (OpenVR)
+- **Proxy** (`VrQueryHmdView`): lukee `Prop_UserIpdMeters_Float` IVRSystemistä, kirjoittaa
+  jaettuun muistiin (`shm->runtimeIpdM` + `runtimeIpdValid`). Loki: `vr: runtime IPD 0.0640 m`.
+- **Plugin** (`HookedStateUpdate`): `g_effIpd` lasketaan per kehys:
+  `baseIpd = runtimeIpdM * units_per_meter` (auto) tai `ipd_units` (käsin), sitten `* world_scale`.
+  Silmäsiirto, aim-offset ja konvergenssi käyttävät `g_effIpd`.
+- **INI:** `[engine] use_runtime_ipd=1` (oletus). `0` = käytä `ipd_units`.
+
+### World Scale
+- Yksi kerroin (`[engine] world_scale`, oletus 1.0) kertoo SEKÄ silmäetäisyyden ETTÄ pään
+  siirtogainin (`s = units_per_meter * world_scale`), joten maailman koko muuttuu yhdellä
+  liukusäätimellä ilman että stereo kalibrointi hajoaa.
+- **SHM:** `StereoSettings.worldScale` (plugin kirjoittaa, proxy lukee muttei sovella — engine-puoli).
+- **MCM:** uusi liuku *Maailman koko (world scale)*, 0.5..2.0, hienosäätö 0.05.
+- **INI:** `[engine] world_scale=1.0`.
+
+### Samalla korjatut perusasetukset
+- `vr_cam_states=0` (vain 1. pers.) → 3. persoonan tuplakuva poistuu (ehdokas).
+- `recenter_key=46` (Delete, ei F9 = pikalahoitus).
+- `fo4flat_probe.dll` Skew-fix: `VrQuatToGameQuat` 3 etumerkkiä korjattu.
+- `fovAdj <= 0 → 1.0` fallback estää väärän aim-tunnistuksen (`fovAdj=0.000`).
+## Nausea root cause + aim detection finding (15.11.2026)
+
+### Nausea = wrong head-rotation basis (FIXED)
+- Oire: huono olo heti pelatessa.
+- Syy: `VrQuatToGameQuat` (matriisipohjainen similarity-transform) kirjoitti pään
+  **yawin pelin eteenpäin-akselille (roll)**. Loki: plugin `head=(0.98 -0.01 0.19 0.03)`
+  → y-komponentti dominoi (y = forward = roll). Pään kääntäminen siis keinutti
+  koko maailmaa → sekunnissa pahoinvointi.
+- Korjaus: palautettu **yksinkertainen oikea kantoformaatiokonjugaatio**:
+  `gameQ = (w, vr.x, -vr.z, vr.y)` eli VR pitch→right, roll→forward(-), yaw→up.
+  Tämä on matemaattisesti oikea muunnos ortonormaalille, det +1 -kannalle T.
+
+### Aim-tunnistus on kuollut (EI vielä korjattu)
+- Plugin: `fovAdj=0.000 target=0.000 perSec=0.000` koko session → `PlayerCamera::fovAdjustCurrent`
+  lukee 0 (väärä offset tälle runtime 1.11.240:lle TAI kenttä ei ole se mitä luultiin).
+  Fallback (`<=0 → 1.0`) estää väärän triggerin mutta aim ei koskaan laukea.
+- Proxy: `game tan x=1.377` luetaan gameplayn aikana, mutta ADS:n FOV-kavennus on vain ~5 %
+  (tan 1.377→~1.307, ratio ~0.95) eikä ylitä `aim_ratio=0.95`-kynnystä → `zoom` pysyy 0.
+  Lisäksi mitattu tan heiluu 1.349..1.400 normaaliajossa.
+- Seuraus: `aim_ipd_scale` ei koskaan aktivoidu → ADS:ssä täysi stereo → tuplakuva tähtäimessä.
+
+**Ratkaisu vaatii oikean datan:** RenderDoc-kaappaus ADS:stä paljastaa (a) pelin oikean
+kameran projektiokonstantit ja FOV-arvot ja (b) `PlayerCamera`-rakenteen oikean kentän
+## Head tracking fix + live ADS calibration (15.11.2026)
+
+- **Päänseuranta toimi vihdoin:** juurisyy oli MCM `bHeadRotComp=1` → plugin laski
+  `prev⁻¹·current` = per-kehyksen delta ≈ identiteetti, joten pään kääntö ei liikuttanut
+  kameraa (vain hiiri). Asetettu 0:aan (MCM Settings + fo4stereo.ini). Samalla nollattu
+  kokeilussa karanneet arvot: `fIPDUnits 10→4.48`, `fAimIpdScale −2→−0.5`.
+  Käyttäjä vahvisti: pään kääntö kääntää näkymää, tähtäys seuraa katsetta, pahoinvointi poissa.
+- **Live ADS-kalibrointi (uusi):** pluginissa VK_LEFT/VK_RIGHT (nuolet) säätävät
+  `aim_ipd_scale`:a 0.05 askelin (edge-trigger + autorepeat 120 ms), clamp −2..2.
+  Siirtää mono-tähtäyskuvaa silmän suuntaan → kohdistaa jyväisen ja poistaa jäännöskaksoiskuvan.
+  Loki: `aim calibrate: aim_ipd_scale=X.XX`. Lopullinen arvo tarkoitus ajaa MCM/iniin.
+- Aseen/etureisien fyysinen kääntyminen katseen mukaan = body-IK (FRIK-luokka, GPL → ei koodia);
+  tulevaisuuden vaihe. Ensimmäisen persoonan ase seuraa jo kameraa → tähtäys on katseessa.
+
+zoom-signaalille. Ilman tätä arvaaminen on hakuammuntaa.
+
+**Väliaikainen kokeilu:** `[vr] aim_ratio=0.98` (tai 0.97) saattaisi laukaista ADS:n ~5 %
+kavennuksella — testattava, mutta riski väärästä triggeristä normaalin FOV-heilunnan takia.
+
+Molemmat DLL:t käännetty ja asennettu 15.11.2026 (plugin 316 KB, proxy 272 KB).
+
+**Testattava:** käynnistä peli, tarkista lokista `vr: runtime IPD ...` ja että pään
+kääntäminen kääntää 3D-näkymää (ei kuvalaatikkoa), eikä peruspelissä ole tuplakuvaa
+1. tai 3. persoonassa. Tämän jälkeen säädetään aseen tähtäys.
+
+**Kriittisiä sovellettavia oppia:**
+
+| Oppi | Sovellus meidän projektiin |
+|------|---------------------------|
+---
+
+## Seuraavat askeleet (Immediate Action Items)
+
+1. **TÄMÄ VIIKKO:** Luo `core/StereoMode.hpp` + pluginin `StereoController.cpp` Synchronized Sequential -tilalle (kaksi framea samalla engine-tikillä).
+2. **TÄMÄ VIIKKO:** Lisää `proxy/ImGuiOverlay.cpp` Insert-näppäiminen ImGui-overlay (IPD, convergence, camera offset, recenter, stereo mode, standing origin).
+3. **TÄMÄ VIIKKO:** Implementoi Runtime IPD (`GetFloatTrackedDeviceProperty(Prop_UserIpdMeters_Float)`) + World Scale -kerroin.
+4. **ENSIMMÄINEN TESTI:** Synchronized Sequential + ImGui overlay → ADS + liike → tuplakuvan on poistunut ilman proxy-hakkia.
+5. **SEURAAVA VIIKKO:** Standing Origin järjestelmä (F9=recenter yaw+pitch, Home=standing origin reset) + Delete-näppäin recenter.
+6. **SEURAAVA VIIKKO:** FRIK-integraation suunnittelu: collision-melee prototyyppi.
+
+---
+
+## Viitteet & Lähteet
+
+- **CyberpunkVR Port:** https://github.com/dariulone/cyberpunk-vr-port
+  - `src/Camera/CameraMath.cpp` — FOV, IPD, basis, world scale
+  - `src/Stereo/EngineStereo.cpp` — Engine-native stereo, mono mode, convergence
+  - `src/Stereo/SyncStereo.cpp` — AFW/OSR, frame timing, frame identity
+  - `src/Stereo/Capture.cpp` — Frame capture, RTV management, depth submit
+  - `src/Camera/PoseIdentity.cpp` — Pose fingerprinting, staleness detection
+  - `include/Stereo/EngineStereo.hpp` — Stereo mode API, mono mode, UI handling
+
+- **UEVR:** https://github.com/praydog/UEVR
+  - README — 3 rendering modes, in-game GUI, motion controls, profile system
+  - Oblivion Remastered UEVR Profile: https://www.nexusmods.com/oblivionremastered/mods/878
+    - Fyysinen combat, holsterit, UI Follow View, asepyörä, standing origin, config UI
+
+- **FRIK (Fallout 4 VR Body):** https://github.com/madjar/FRIK — GPL-3.0, idea-viittaus vain (ei koodikopia)
+| **AFW + oma rekonstruktio (OSR):** toinen silmä rakennetaan edellisen kehyksen väristä, syvyydestä ja liikkeestä (~0,44 ms GPU) → kehyksen hinta ~yksi silmä. | Suora vastaus meidän "puolet frameraatesta" -rajoitteeseen. OSR tuottaisi "melkein natiivi" framerate. |
+| **Näkymät tunnistetaan nimellä, ei eliminoinnilla:** virtuaalikameran nimen hash. | Proxy tunnistaa kameratilat indeksillä; sama oppi pätee Pip-Boy-kohteen valintaan. |
+| **Molempien näkymien pitää jakaa rakenteet:** varjokaskadit, shader-kello, heijastusmarssi. | Meidän silmäsiirto moottorin omassa kamerassa välttää ongelman. |
+| **Upskalerille oma konteksti per silmä:** FSR2/DLSS keräävät toisen silmän historiaa → IPD:aave. | FSR1 on turvallinen; jos siirrytään FSR2/DLSS:ään, konteksti pitää jakaa per silmä. |
+| **Per-silmä syvyyskerros submitissä:** `IVRCompositor::SubmitWithLayer` + depth. | Me OpenVR:ssä: SubmitWithLayer + depth-kerros parantaa ATW:tä merkittävästi. |
+| **Runtime IPD:** `OpenXRManager::GetRuntimeIpd()` → automaattinen kalibraatio. | OpenVR:stä `GetFloatTrackedDeviceProperty(Prop_UserIpdMeters_Float)` poistaisi kalibroinnin. |
+| **World Scale:** `xr_world_scale` kertoo SILMÄETÄISYYDEN JA PAÄN SIIRTOGAININ yhdellä liukusäätimellä. | Yhdistä `units_per_meter` + `ipd_units` → `world_scale` kerroin. |
+| **Vertikaalinen FOV totuuslähteenä:** moottorin FOV on VERTikaalinen. | Proxy mittaa game tan X/Y; varmista vertikaalinen FOV perusta. |
+| **Mono-tila = pään keskipiste:** EngineStereo mono = yksi kuva pään keskipisteestä molemmille silmille. | `aim_ipd_scale=0` tekee kameran offsetista nollan; ADS-monon toteutuminen on erikseen varmistettava. CyberpunkVR:n ADS-kohdistus puolestaan muuttaa aseen poseerausta silmän mukaan. |
+| **Komprehensiiviset debug-exportit:** `CyberpunkVR_Debug*` globaalit muuttujat. | Lisää `fo4flat_Debug*` exportit plugin/proxy:lle. |
+ja [UEVR](https://github.com/praydog/UEVR) + [Oblivion Remastered UEVR-profiili](https://www.nexusmods.com/oblivionremastered/mods/878) (Lua-scriptattu fyysinen combat, holsterit, UI Follow View).
+### B. UEVR — Universaali UE4/5 VR-injektori + Oblivion Remastered UEVR-profiili
+
+**Arkkitehtuuri (README + UEVR-profiilin ominaisuudet):**
+- **Prosessin injektori (UEVRInjector.exe):** .NET 6.0 GUI, runtime-valinta (OpenVR/OpenXR), VR-plugineiden nullifikaatio.
+- **Kolme renderöintitilaa (valittava live):**
+  1. **Native Stereo** — Engine oma stereo-pipeline (paras laatu/perf)
+  2. **Synchronized Sequential** — Kaksi framea SAMALLA engine-tikillä, synkronoitu (korjaa bugeja, TAA-ghosting)
+  3. **AFR** — Silmät vuorottelevat kehyksissä (nausea-riski)
+- **In-game GUI (Insert / L3+R3):** ImGui-overlay, live-säädöt:
+  - RT + Left Stick: Kamera-offset
+  - RT + Right Stick: Kamera-offset ylä/ala
+  - RT + B: Reset camera offset
+  - RT + Y: Recenter view
+  - RT + X: Reset standing origin
+- **Automaattinen UI-projektointi 3D-avaruuteen:** UI render-passit havaitaan, projisoidaan mukavaan syvyyteen.
+- **Motion Controls Blueprint/Lua-scriptattavissa:** 3DOF/6DOF, roomscale movement.
+- **Profiilijärjestelmä:** Profiilit = zip-paketit (config + Lua + ESP/ESM + per-exe targeting).
+
+**Oblivion Remastered UEVR-profiilin (Pande4360) konkreettisia innovaatioita:**
+
+| Ominaisuus | Teknistys | Sovellus Fallout 4:een |
+|-----------|-----------|------------------------|
+| **Fyysinen combat (collision-pohjainen):** aseen/kielen törmäys → vahinko, voima = kevy/raske, parry = kielen/aseen törmäys vihun aseeseen. | Lua-scripti hookaa fysiikkamoottorin collision-eventit. | Havok-fysiikka → FRIK-integraation kautta collision-melee, block, parry. |
+| **Holster-järjestelmä (body-relative):** Quickslotit kartoitetaan ruumiin paikkoihin. | Quickslot-mappaus body-local koordinaatteihin. | Pip-Boy quickslotit → ruumiin paikkoihin (MCM-sivu "Holster Positions"). |
+| **Kaksoiskäsivyöt:** molemmat kädet vyössä → realistinen vetäytys. | Lua tunnistaa molemmat controllerit samalla objektilla. | Kaksinkertaiset aseet → kaksinkertainen käden asento. |
+| **Gesture-hyökkäykset:** lyönnin voima → kevy/raske; collision → block/parry. | Controllerin vauhti + suunta + collision-normal. | Melee-aseet: swipe-force → damage tier; shield-block kun kääntää kilven vihun aseen suuntaan. |
+| **UI Follow View -tila:** UI seuraa päätä, A-painike välillä vaihtaa head-aimingiin. | Lua muuttaa UI-kameran parentiksi HMD:n. | Pip-Boy/terminat/container UI: UI seuraa päätä, head-aim väliaikaisesti. |
+| **Asepyörä (Quickslot Wheel):** LeftGrip+Y → radiaalinen valikko ruumiin paikkoihin. | ImGui/Lua radial menu world-space. | Favoritit/quickslotit: controller-grip + tick → radiaalivalikko. |
+| **Config UI UEVR:n sisällä:** Lua-scriptattu ImGui-valikko. | Lua + ImGui = live-säädöt ilman pelin pysäytystä. | Lisää in-game ImGui-overlay (Insert-näppäin) pika-säädöille. |
+| **Standing Origin -järjestelmä:** RT+X = nollaa standing origin, RT+B = nollaa kamera-offset, RT+Y = recenter view. | Erottaa "lattiakalibraation" "kamera-fine-tuningista". | Lisää `standing_origin` + `camera_offset` erottelu; F9 recenter → yaw+pitch, Home → standing origin reset. |
+| **Pre-injection checklist (UEVRInjector):** HDR pois, admin, -nohmd, VR-pluginit pois, overlayt pois, DLSS FG pois. | Yksi klikkaus "Prepare Game" -toiminto. | Launcher/injector: konfliktitarkistus, DLL-backup, uninstall-palautus. |
+| **Per-exe profiling:** Win64 (Steam) vs WinGDK (GamePass) eri profiilit. | Auto-detektio game versionista. | Steam/GOG/GamePass -detektointi profiilien valintaan. |
+## 17.11.2026 – HUD-paneelit, säätötila, HUD-tiedoston mittaus ja patchaus
+
+**Tehty (proxy, `d3d11.dll`):**
+- Keskustelupaneeli: valinnat leikataan silmätekstuurista (`dialogue_panel_crop`), tausta tummennetaan (`VrDialoguePanelUpdate`). Paneeli pysyy näkyvissä koko keskustelun (`dialogue_panel_gate=0`), koska valintojen tunnistus vilkutti paneelia.
+- Oma ristikko: proxyn generoima tekstuuri head-locked-overlayna (`reticle`, `reticle_deg`, `reticle_dist_m`, `reticle_yaw_deg`, `reticle_pitch_deg`). Pelin oma ristikko pois `bCrosshairEnabled=0`.
+- HUD-paneelit: HP, ammu ja kompassi leikataan pelin HUD:sta ja näytetään head-locked-paneeleina (`hud_panels`, `hud_*_crop`, `hud_*_yaw/pitch/width`). Alkuperäinen HUD peitetään maailmakuvasta (`hud_mask`). Paneelit lukevat kehyksen, joka on juuri kirjoitettu (`g_hudSrc`), jotta vilkkuminen loppuu. Tausta on läpinäkyvä, jos `hud_bg_alpha=0`.
+- Säätötila pelissä: Numpad 5 päälle/pois, Numpad 1/9/3 valinta (HP/ammu/kompassi), 4/6 ja 8/2 siirto, +/- koko, 0 tallennus `fo4stereo.ini`-tiedostoon. Keskellä ruutua näkyvä ohjepaneeli.
+- Kolmas persoona: HUD-paneelit näkyvät myös tilassa 7.
+
+**Tehty (HUD-tiedoston mittaus ja patchaus):**
+- Pelin oma `HUDMenu.swf` purettiin `Fallout4 - Interface.ba2`-arkistosta (vain luettu). Työkalut: `tools/hud/` (`extract_one.py`, `swf_layout.py`, `swf_patch.py`). Bethesdan tiedostoa ei ole repossa.
+- Mittaus (stage 1280×720): `BottomCenterGroup_mc` (640, 684), `CenterGroup_mc` (640, 360), `HUDNotificationsGroup_mc` (64, 36). `HPMeter_mc`, `AmmoCount_mc` ja `CompassWidget_mc` ovat ryhmien sisällä.
+- Testi-patch: `BottomCenterGroup` ylös 40 px, `HUDNotificationsGroup` vasemmalle 20 px. Asennettu pelikansioon `Data\Interface\HUDMenu.swf` (alkuperäinen palautetaan poistamalla tiedosto). Compass-leikkausalue siirretty vastaamaan (`hud_compass_crop=0.37,0.85,0.63,0.93`).
+
+**Avoimet:**
+- Testi-HUD:n toimivuus pelissä (Flash-lataus, sijainnit, luettavuus).
+- Kartta- ja tehtävämarkkerit eivät ole vielä mukana paneeleissa.
+- Pään kääntämisen sulavuus ja tuplakuva: rakenteellinen (AFR), ei korjattu.
+- MCM-sivu näkyvyydelle ja sijainnille: erillinen mod, ks. `docs/TODO.md`.
+
+## 18.11.2026 – MO2, MCM, HUD-kehys ja HUD-sovitus
+
+**Tehty:**
+- Mod Organizer 2 (virallinen v2.5.2) asennettu kannettavana `C:\Modding\MO2`. Instanssi `F4Flat2VR`, mod `F4Flat2VR_Dev` (ei pelikansion kopiointia).
+- MCM-konfiguraatio (`mo2/F4Flat2VR_Dev/MCM`): sivut HUD-alue (reunat), Keskustelu ja Yleiset. Proxy lukee MCM:n asetustiedoston, kun se on olemassa.
+- HUD-kehys: reunat asteina (vasen/oikea/yläreuna/alareuna). Elementit sijoitetaan kehyksen sisään ja niiden koko rajoitetaan reunoihin. Numpad 5 -säätötila (kehys/elementti/leikkaus), Numpad +/- zoomaa koko HUD:n, Numpad 0 tallentaa reunat.
+- Kaatuminen Papyrus-natiivin rekisteröinnissä (`BindNativeMethod`) todennettu myös tyhjällä no-op-funktiolla, joten Papyrus-natiivireitti hylättiin. Plugin palautettu pre-Papyrus-versioon.
+- ESP ja Papyrus-skripti (`Fo4StereoHud`) luotiin, mutta niitä ei käytetä ennen kuin Papyrus-reitti on korjattu.
+- `tools/hud/swf_fit.py`: sovittaa pelin oman `HUDMenu.swf`:n juuritason sijoitukset kehykseen (tasainen skaalaus). Mittaus osoitti, että peli ei piirrä HUD:ia täysin laskennallisesti, joten sijoitus pitää kalibroida. Kalibrointitesti tehtiin (`BottomCenterGroup` siirretty 500 px ylös).
+- Keskustelupaneeli palautettu kehyksen keskelle (`dialogue_panel=1`).
+
+**Avoimet:**
+- HUD-sijoituksen kalibrointi (kalibrointitestin tulos ja muunnoksen korjaus).
+- Kuvanlaatu: kehyksen pystykorkeus rajoittaa tekstin kokoa.
+- Pään kääntämisen sulavuus ja tuplakuva (AFR-rakenne), ei korjattu.
+- Papyrus-reitti (HP/ammu) pois, kunnes natiivin rekisteröinti on ratkaistu.

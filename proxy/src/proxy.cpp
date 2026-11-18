@@ -25,6 +25,9 @@
 #include "fsr1_shaders.h"
 #include <shlobj.h>
 #include <d3dcompiler.h>
+#if FO4STEREO_HAS_RENDERDOC_API
+#include <renderdoc_app.h>
+#endif
 
 typedef HRESULT(STDMETHODCALLTYPE* PresentFn)(IDXGISwapChain*, UINT, UINT);
 typedef void(STDMETHODCALLTYPE* VSSetCBFn)(ID3D11DeviceContext*, UINT, UINT, ID3D11Buffer* const*);
@@ -286,6 +289,10 @@ static void PatchCameraBuffer(void* ptr, UINT bytes) {
     g_projNear = row(6)[3];
 
     if (!g_stereoEnabled || g_ampUnits == 0.0f) return;
+    // Defense in depth: a NaN/inf shift would write NaN view-projections into
+    // the world's constant buffers (world vanishes to a gray void, only the
+    // character+weapon survive, since they use different buffers).
+    if (!std::isfinite(g_frameShift)) return;
 
     // Same shift for every pass of a frame (updated once per Present), otherwise
     // depth prepass and color pass disagree and produce streaks/ghosting.
@@ -580,11 +587,142 @@ static void OpenLogs() {
     g_log = _fsopen((dir + "fo4stereo_proxy.log").c_str(), "w", _SH_DENYNO);
     g_dump = _fsopen((dir + "fo4stereo_cb.bin").c_str(), "wb", _SH_DENYNO);
     Log("fo4stereo proxy loaded");
-    QueryPerformanceFrequency(&g_qpf);
-    QueryPerformanceCounter(&g_qpcStart);
-    LoadStereoConfig();
-    Log("stereo experiment: enabled=%d amp_units=%.3f period_sec=%.2f",
-        g_stereoEnabled ? 1 : 0, g_ampUnits, g_periodSec);
+}
+
+#pragma pack(push, 1)
+struct BmpFileHeader {
+    uint16_t type;
+    uint32_t size;
+    uint16_t reserved1;
+    uint16_t reserved2;
+    uint32_t offBits;
+};
+
+struct BmpInfoHeader {
+    uint32_t size;
+    int32_t width;
+    int32_t height;
+    uint16_t planes;
+    uint16_t bitCount;
+    uint32_t compression;
+    uint32_t sizeImage;
+    int32_t xPelsPerMeter;
+    int32_t yPelsPerMeter;
+    uint32_t clrUsed;
+    uint32_t clrImportant;
+};
+#pragma pack(pop)
+
+static bool SaveTextureBmp(ID3D11Texture2D* source, const std::string& path) {
+    if (!source || !g_dev || !g_ctx) {
+        Log("vr: capture failed: missing texture or D3D device");
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    source->GetDesc(&desc);
+    const bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS
+        || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM
+        || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    const bool bgra = desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS
+        || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM
+        || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const bool bgrx = desc.Format == DXGI_FORMAT_B8G8R8X8_TYPELESS
+        || desc.Format == DXGI_FORMAT_B8G8R8X8_UNORM
+        || desc.Format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+    if ((!rgba && !bgra && !bgrx) || desc.ArraySize != 1 || desc.MipLevels != 1
+            || desc.SampleDesc.Count != 1 || desc.Width == 0 || desc.Height == 0) {
+        Log("vr: capture failed: unsupported texture format=%u size=%ux%u array=%u mips=%u samples=%u",
+            static_cast<unsigned>(desc.Format), desc.Width, desc.Height, desc.ArraySize, desc.MipLevels,
+            desc.SampleDesc.Count);
+        return false;
+    }
+
+    const uint64_t imageBytes = static_cast<uint64_t>(desc.Width) * desc.Height * 4;
+    if (imageBytes > 0xFFFFFFFFull - sizeof(BmpFileHeader) - sizeof(BmpInfoHeader)) {
+        Log("vr: capture failed: texture is too large (%ux%u)", desc.Width, desc.Height);
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC stagingDesc = desc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    ID3D11Texture2D* staging = nullptr;
+    HRESULT hr = g_dev->CreateTexture2D(&stagingDesc, nullptr, &staging);
+    if (FAILED(hr) || !staging) {
+        Log("vr: capture failed: staging texture creation hr=0x%08x", static_cast<unsigned>(hr));
+        return false;
+    }
+
+    g_ctx->CopyResource(staging, source);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr) || !mapped.pData) {
+        Log("vr: capture failed: staging map hr=0x%08x rowPitch=%u", static_cast<unsigned>(hr), mapped.RowPitch);
+        staging->Release();
+        return false;
+    }
+    if (mapped.RowPitch < desc.Width * 4) {
+        Log("vr: capture failed: invalid rowPitch=%u for width=%u", mapped.RowPitch, desc.Width);
+        g_ctx->Unmap(staging, 0);
+        staging->Release();
+        return false;
+    }
+
+    BmpFileHeader fileHeader = {};
+    fileHeader.type = 0x4D42;
+    fileHeader.size = static_cast<uint32_t>(sizeof(fileHeader) + sizeof(BmpInfoHeader) + imageBytes);
+    fileHeader.offBits = static_cast<uint32_t>(sizeof(fileHeader) + sizeof(BmpInfoHeader));
+    BmpInfoHeader infoHeader = {};
+    infoHeader.size = sizeof(infoHeader);
+    infoHeader.width = static_cast<int32_t>(desc.Width);
+    infoHeader.height = -static_cast<int32_t>(desc.Height);
+    infoHeader.planes = 1;
+    infoHeader.bitCount = 32;
+    infoHeader.sizeImage = static_cast<uint32_t>(imageBytes);
+
+    FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "wb") != 0 || !file) {
+        g_ctx->Unmap(staging, 0);
+        staging->Release();
+        Log("vr: capture failed: cannot open %s", path.c_str());
+        return false;
+    }
+
+    bool ok = fwrite(&fileHeader, sizeof(fileHeader), 1, file) == 1
+        && fwrite(&infoHeader, sizeof(infoHeader), 1, file) == 1;
+    std::vector<uint8_t> row(static_cast<size_t>(desc.Width) * 4);
+    const auto* pixels = static_cast<const uint8_t*>(mapped.pData);
+    for (UINT y = 0; ok && y < desc.Height; ++y) {
+        const uint8_t* src = pixels + static_cast<size_t>(y) * mapped.RowPitch;
+        if (rgba) {
+            for (UINT x = 0; x < desc.Width; ++x) {
+                row[x * 4 + 0] = src[x * 4 + 2];
+                row[x * 4 + 1] = src[x * 4 + 1];
+                row[x * 4 + 2] = src[x * 4 + 0];
+                row[x * 4 + 3] = src[x * 4 + 3];
+            }
+        } else {
+            memcpy(row.data(), src, static_cast<size_t>(desc.Width) * 4);
+            if (bgrx) {
+                for (UINT x = 0; x < desc.Width; ++x) row[x * 4 + 3] = 0xFF;
+            }
+        }
+        ok = fwrite(row.data(), row.size(), 1, file) == 1;
+    }
+    fclose(file);
+    g_ctx->Unmap(staging, 0);
+    staging->Release();
+    if (!ok) {
+        DeleteFileA(path.c_str());
+        Log("vr: capture failed: write error for %s", path.c_str());
+        return false;
+    }
+    Log("vr: captured %ux%u texture format=%u to %s", desc.Width, desc.Height,
+        static_cast<unsigned>(desc.Format), path.c_str());
+    return true;
 }
 
 static uint64_t Fnv1a(const uint8_t* p, size_t n) {
@@ -677,14 +815,32 @@ static int g_seqStill = 0;
 static int g_flatPrev = -1;
 static UINT g_poseWrites = 0;
 static bool g_vrUseBounds = true;   // [vr] fov_bounds
+static int g_vrCaptureAimFrames = 0;   // [vr] capture_aim_frames (0=off 1=pair 2=burst)
+static int g_renderDocCaptureKey = 122;    // [vr] renderdoc_capture_key (VK_F11)
 static bool g_monoAim = false;      // first-person aim: both frames are the same image
 static bool g_vrNoVsync = true;     // [vr] no_vsync
 static bool g_vrAutoConfigure = true;  // [vr] auto_configure
 static float g_coverH = 0.0f;          // headset cover tan(half horizontal FOV)
 static float g_vrAimRatio = 0.95f;     // [vr] aim_ratio: game FOV narrower than this x headset -> aiming (mono)
+// Head view offsets ([vr] head_yaw_offset_deg / head_pitch_offset_deg, [vr] recenter_key).
+// OpenVR's seated ResetZeroPose resets position and yaw but NOT pitch: a recenter done
+// while looking slightly down leaves the whole game view permanently tilted. These
+// offsets (radians) are baked into the pose written to shared memory, and into the
+// 2D screen transform, so the game view and the overlay stay aligned.
+static float g_yawOff = 0.0f, g_pitchOff = 0.0f;
+static int g_recenterKey = 0;          // VK code; 0 = disabled
 static float g_vrPipboyRatio = 0.5f;   // [vr] pipboy_ratio: narrower than this -> Pip-Boy (2D screen)
 static bool g_vrPipboy2D = true;       // [vr] pipboy_2d
 static bool g_vrOtherCams2D = true;    // [vr] other_cams_2d: VATS, dialogue, 3rd person... on the 2D screen
+// [vr] submit_with_pose: submit every eye texture together with the HMD pose it was RENDERED with
+// (the pose of the WaitGetPoses call before the frame was built). Without it the compositor assumes
+// both textures were rendered at the newest pose; the eye that was refreshed one tick earlier then
+// lags by a frame during head motion and the two eyes disagree (double image in first person).
+static bool g_vrSubmitPose = true;
+static vr::HmdMatrix34_t g_lastHmdPose = {};   // raw pose from the previous WaitGetPoses
+static bool g_lastHmdPoseOk = false;
+static vr::HmdMatrix34_t g_eyePose[2] = {};    // pose each eye texture's content was rendered with
+static bool g_eyePoseOk[2] = { false, false };
 static LONG g_zoomPrev = -1, g_camStatePrev = -1;
 static unsigned g_vrCamMask = (1u << 0) | (1u << 7);  // [vr] vr_cam_states: states shown in VR (0 first person, 7 third person)
 static int g_boundsLogged = 0;
@@ -704,6 +860,63 @@ static int g_pipCandCount = 0;
 static ID3D11Texture2D* g_pipTex = nullptr;   // shareable copy for the overlay
 static ID3D11Texture2D* g_pipTexSrc = nullptr;
 static bool g_overlayIsPip = false;
+static bool g_overlayIsAds = false;          // overlay currently placed as the head-locked ADS view
+static bool g_overlayIsDlg = false;          // overlay currently placed as the dialogue panel (cropped)
+static bool g_vrDlgPanel = true;             // [vr] dialogue_panel: magnified dialogue options panel
+static bool g_dlgGate = false;               // [vr] dialogue_panel_gate: hide the panel when no options are on screen (flickers)
+static bool g_vrDlgFull = false;            // [vr] dialogue_panel_full: 1 = whole frame as a flat head-locked screen
+static float g_vrDlgDist = 1.2f, g_vrDlgWidth = 1.4f, g_vrDlgY = -0.05f;  // panel distance / width / height (m)
+static float g_dlgCrop[4] = { 0.33f, 0.79f, 0.67f, 0.90f };               // crop u0,v0,u1,v1: the options band only
+static bool g_vrReticle = true;               // [vr] reticle: own head-locked reticle overlay
+static float g_reticleDist = 2.5f;            // [vr] reticle_dist_m
+static float g_reticleDeg = 1.2f;             // [vr] reticle_deg (total angular size)
+static vr::VROverlayHandle_t g_reticleOverlay = vr::k_ulOverlayHandleInvalid;
+static ID3D11Texture2D* g_reticleTex = nullptr;
+static bool g_reticleShown = false;
+static bool g_reticleInitTried = false;
+static bool g_hudPlaceholder = false;     // [vr] hud_placeholder: element names as text panels (layout work)
+static bool g_hudFrame = false;           // [vr] hud_frame: all panels placed inside one frame
+static float g_frameYaw = 0.0f, g_framePitch = -5.0f, g_frameWDeg = 100.0f, g_frameHDeg = 50.0f;
+static float g_hudFx[13], g_hudFy[13];    // normalised position of each element inside the frame
+
+
+// HUD panels (see the HUD section below): HP, ammo and compass cropped from the game's HUD.
+struct HudPanel {
+    const char* key;
+    float crop[4];                 // u0, v0, u1, v1 of the eye frame
+    float yawDeg, pitchDeg, widthM;
+    vr::VROverlayHandle_t ov;
+    ID3D11Texture2D* tex;          // shared texture the overlay shows
+    ID3D11Texture2D* stage;        // CPU-readable copy of the crop
+    UINT w, h;
+    DXGI_FORMAT fmt;
+    bool overlayTried, shown;
+    bool enabled;                  // [vr] hud_<name>_enabled
+};
+static HudPanel g_hud[13] = {
+    { "fo4stereo.hud.hp", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.ammo", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.compass", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.effects", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.location", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.notify", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.prompt", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.explosive", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.crit", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.ap", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.rads", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.flash", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+    { "fo4stereo.hud.enemy", { 0.00f, 0.00f, 1.00f, 1.00f }, 0.0f, -5.0f, 0.30f, vr::k_ulOverlayHandleInvalid, nullptr, nullptr, 0, 0, DXGI_FORMAT_UNKNOWN, false, false, true },
+};
+static bool g_hudPanelsOn = true;     // [vr] hud_panels
+static bool g_hudMask = true;         // [vr] hud_mask: remove the HUD from the world image
+static float g_hudDist = 1.2f;        // [vr] hud_dist_m
+static int g_hudBgAlpha = 0;          // [vr] hud_bg_alpha: panel background opacity (0 = text only)
+static ID3D11Texture2D* g_hudSrc = nullptr;  // eye texture written this present (fresh, unmasked)
+static float g_reticleYawDeg = 0.0f, g_reticlePitchDeg = 0.0f;  // [vr] reticle_yaw_deg / reticle_pitch_deg: shift to match the bullet path
+static bool g_vrAdsOverlay = true;         // [vr] ads_overlay (legacy): 1 = start in overlay mode
+static LONG g_adsMode = 1;                   // [vr] ads_mode: 0 mono eye textures, 1 head-locked overlay, 2 stereo (Insert cycles)
+static float g_vrAdsOverlayDist = 4.0f;      // [vr] ads_overlay_distance_m
 static ID3D11RenderTargetView* g_pipRtv[32] = {};
 static int g_pipRtvCand[32] = {};
 static volatile LONG g_pipRtvCount = 0;
@@ -737,12 +950,30 @@ static ID3D11SamplerState* g_upSamp = nullptr;      // linear clamp for the EASU
 static UINT g_upSrcW = 0, g_upSrcH = 0, g_upSrcF = 0;
 static HWND g_gameHwnd = nullptr;                   // swapchain window, for focus/mouse handling
 
+// Places element i inside the frame so that the whole element (its half width in degrees) stays within
+// the frame edges. fx/fy are mapped onto the reduced range [left+half, right-half] x [bottom+half, top-half].
+static void HudFrameAngles(int i, float& outYaw, float& outPitch) {
+    const float L = g_frameYaw - g_frameWDeg * 0.5f, R = g_frameYaw + g_frameWDeg * 0.5f;
+    const float T = g_framePitch + g_frameHDeg * 0.5f, B = g_framePitch - g_frameHDeg * 0.5f;
+    const float halfDeg = atan2f(g_hud[i].widthM * 0.5f, g_hudDist) * 57.2957795f;
+    const float loY = L + halfDeg, hiY = R - halfDeg;
+    const float loP = B + halfDeg, hiP = T - halfDeg;
+    outYaw = (hiY > loY) ? loY + g_hudFx[i] * (hiY - loY) : g_frameYaw;
+    outPitch = (hiP > loP) ? hiP - g_hudFy[i] * (hiP - loP) : g_framePitch;
+}
+static std::string g_iniPath;  // the settings file in use: MCM settings if present, else fo4stereo.ini
+
 static void LoadVrConfig() {
     char dir[MAX_PATH];
     GetModuleFileNameA(nullptr, dir, MAX_PATH);
     char* slash = strrchr(dir, '\\');
     if (slash) *(slash + 1) = '\0';
-    std::string ini = dir + std::string("fo4stereo.ini");
+    // MCM writes its settings to Data\MCM\Settings\F4Flat2VR.ini (same keys as fo4stereo.ini).
+    // When that file exists it is the source of truth, otherwise fo4stereo.ini is used.
+    const std::string mcmIni = std::string(dir) + "Data\\MCM\\Settings\\F4Flat2VR.ini";
+    const bool useMcm = GetFileAttributesA(mcmIni.c_str()) != INVALID_FILE_ATTRIBUTES;
+    std::string ini = useMcm ? mcmIni : std::string(dir) + "fo4stereo.ini";
+    g_iniPath = ini;
     char buf[64] = {};
     GetPrivateProfileStringA("vr", "enabled", "0", buf, sizeof(buf), ini.c_str());
     g_vrEnabled = atoi(buf) != 0;
@@ -760,6 +991,10 @@ static void LoadVrConfig() {
     g_vrOverlayDist = static_cast<float>(atof(buf));
     GetPrivateProfileStringA("vr", "fov_bounds", "1", buf, sizeof(buf), ini.c_str());
     g_vrUseBounds = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "capture_aim_frames", "0", buf, sizeof(buf), ini.c_str());
+    g_vrCaptureAimFrames = atoi(buf);
+    GetPrivateProfileStringA("vr", "renderdoc_capture_key", "122", buf, sizeof(buf), ini.c_str());
+    g_renderDocCaptureKey = atoi(buf);
     GetPrivateProfileStringA("vr", "no_vsync", "1", buf, sizeof(buf), ini.c_str());
     g_vrNoVsync = atoi(buf) != 0;
     GetPrivateProfileStringA("vr", "auto_configure", "1", buf, sizeof(buf), ini.c_str());
@@ -772,6 +1007,120 @@ static void LoadVrConfig() {
     g_vrPipboy2D = atoi(buf) != 0;
     GetPrivateProfileStringA("vr", "other_cams_2d", "1", buf, sizeof(buf), ini.c_str());
     g_vrOtherCams2D = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "submit_with_pose", "1", buf, sizeof(buf), ini.c_str());
+    g_vrSubmitPose = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "ads_overlay", "1", buf, sizeof(buf), ini.c_str());
+    g_vrAdsOverlay = atoi(buf) != 0;
+    g_adsMode = g_vrAdsOverlay ? 1 : 0;
+    GetPrivateProfileStringA("vr", "ads_mode", "-1", buf, sizeof(buf), ini.c_str());
+    if (atoi(buf) >= 0 && atoi(buf) <= 2) g_adsMode = atoi(buf);
+    GetPrivateProfileStringA("vr", "ads_overlay_distance_m", "4.0", buf, sizeof(buf), ini.c_str());
+    g_vrAdsOverlayDist = static_cast<float>(atof(buf));
+    if (g_vrAdsOverlayDist < 0.5f) g_vrAdsOverlayDist = 0.5f;
+    Log("vr config: submit_with_pose=%d ads_overlay=%d dist=%.1f", g_vrSubmitPose ? 1 : 0, g_vrAdsOverlay ? 1 : 0,
+        g_vrAdsOverlayDist);
+    GetPrivateProfileStringA("vr", "dialogue_panel", "1", buf, sizeof(buf), ini.c_str());
+    g_vrDlgPanel = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "dialogue_panel_gate", "0", buf, sizeof(buf), ini.c_str());
+    g_dlgGate = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "dialogue_panel_full", "0", buf, sizeof(buf), ini.c_str());
+    g_vrDlgFull = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "dialogue_panel_dist_m", "1.2", buf, sizeof(buf), ini.c_str());
+    g_vrDlgDist = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "dialogue_panel_width_m", "1.4", buf, sizeof(buf), ini.c_str());
+    g_vrDlgWidth = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "dialogue_panel_y_m", "-0.05", buf, sizeof(buf), ini.c_str());
+    g_vrDlgY = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "dialogue_panel_crop", "0.33,0.79,0.67,0.90", buf, sizeof(buf), ini.c_str());
+    {
+        float c[4];
+        if (sscanf_s(buf, "%f,%f,%f,%f", &c[0], &c[1], &c[2], &c[3]) == 4 && c[2] > c[0] && c[3] > c[1]) {
+            for (int i = 0; i < 4; ++i) g_dlgCrop[i] = c[i] < 0.0f ? 0.0f : (c[i] > 1.0f ? 1.0f : c[i]);
+        }
+    }
+    if (g_vrDlgDist < 0.4f) g_vrDlgDist = 0.4f;
+    GetPrivateProfileStringA("vr", "reticle", "1", buf, sizeof(buf), ini.c_str());
+    g_vrReticle = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "reticle_dist_m", "2.5", buf, sizeof(buf), ini.c_str());
+    g_reticleDist = static_cast<float>(atof(buf));
+    if (g_reticleDist < 0.5f) g_reticleDist = 0.5f;
+    GetPrivateProfileStringA("vr", "reticle_deg", "3.0", buf, sizeof(buf), ini.c_str());
+    g_reticleDeg = static_cast<float>(atof(buf));
+    if (g_reticleDeg < 0.1f) g_reticleDeg = 0.1f;
+    GetPrivateProfileStringA("vr", "reticle_yaw_deg", "0", buf, sizeof(buf), ini.c_str());
+    g_reticleYawDeg = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "reticle_pitch_deg", "0", buf, sizeof(buf), ini.c_str());
+    g_reticlePitchDeg = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "hud_panels", "1", buf, sizeof(buf), ini.c_str());
+    g_hudPanelsOn = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "hud_mask", "1", buf, sizeof(buf), ini.c_str());
+    g_hudMask = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "hud_dist_m", "1.2", buf, sizeof(buf), ini.c_str());
+    g_hudDist = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "hud_bg_alpha", "0", buf, sizeof(buf), ini.c_str());
+    g_hudBgAlpha = atoi(buf);
+    if (g_hudBgAlpha < 0) g_hudBgAlpha = 0;
+    if (g_hudBgAlpha > 255) g_hudBgAlpha = 255;
+    GetPrivateProfileStringA("vr", "hud_placeholder", "0", buf, sizeof(buf), ini.c_str());
+    g_hudPlaceholder = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "hud_frame", "0", buf, sizeof(buf), ini.c_str());
+    g_hudFrame = atoi(buf) != 0;
+    GetPrivateProfileStringA("vr", "hud_frame_yaw_deg", "0", buf, sizeof(buf), ini.c_str());
+    g_frameYaw = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "hud_frame_pitch_deg", "-5", buf, sizeof(buf), ini.c_str());
+    g_framePitch = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "hud_frame_width_deg", "100", buf, sizeof(buf), ini.c_str());
+    g_frameWDeg = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "hud_frame_height_deg", "50", buf, sizeof(buf), ini.c_str());
+    g_frameHDeg = static_cast<float>(atof(buf));
+    // Optional explicit screen edges (degrees from view centre). When present they override centre/size.
+    {
+        float edge[4]; bool have[4];
+        const char* ek[4] = { "hud_frame_left_deg", "hud_frame_right_deg", "hud_frame_top_deg", "hud_frame_bottom_deg" };
+        for (int e = 0; e < 4; ++e) {
+            GetPrivateProfileStringA("vr", ek[e], "", buf, sizeof(buf), ini.c_str());
+            have[e] = buf[0] != 0;
+            edge[e] = have[e] ? static_cast<float>(atof(buf)) : 0.0f;
+        }
+        if (have[0] && have[1] && edge[1] > edge[0]) { g_frameYaw = (edge[0] + edge[1]) * 0.5f; g_frameWDeg = edge[1] - edge[0]; }
+        if (have[2] && have[3] && edge[2] > edge[3]) { g_framePitch = (edge[2] + edge[3]) * 0.5f; g_frameHDeg = edge[2] - edge[3]; }
+    }
+    static const char* const hudNames[13] = { "hp", "ammo", "compass", "effects", "location", "notify", "prompt", "explosive", "crit", "ap", "rads", "flash", "enemy" };
+    for (int i = 0; i < 13; ++i) {
+        char k[64];
+        sprintf_s(k, sizeof(k), "hud_%s_crop", hudNames[i]);
+        GetPrivateProfileStringA("vr", k, "", buf, sizeof(buf), ini.c_str());
+        float c[4];
+        if (sscanf_s(buf, "%f,%f,%f,%f", &c[0], &c[1], &c[2], &c[3]) == 4 && c[2] > c[0] && c[3] > c[1]) {
+            for (int j = 0; j < 4; ++j) g_hud[i].crop[j] = c[j];
+        }
+        sprintf_s(k, sizeof(k), "hud_%s_yaw_deg", hudNames[i]);
+        GetPrivateProfileStringA("vr", k, "", buf, sizeof(buf), ini.c_str());
+        if (buf[0]) g_hud[i].yawDeg = static_cast<float>(atof(buf));
+        sprintf_s(k, sizeof(k), "hud_%s_pitch_deg", hudNames[i]);
+        GetPrivateProfileStringA("vr", k, "", buf, sizeof(buf), ini.c_str());
+        if (buf[0]) g_hud[i].pitchDeg = static_cast<float>(atof(buf));
+        sprintf_s(k, sizeof(k), "hud_%s_width_m", hudNames[i]);
+        GetPrivateProfileStringA("vr", k, "", buf, sizeof(buf), ini.c_str());
+        if (buf[0]) g_hud[i].widthM = static_cast<float>(atof(buf));
+        sprintf_s(k, sizeof(k), "hud_%s_enabled", hudNames[i]);
+        GetPrivateProfileStringA("vr", k, "", buf, sizeof(buf), ini.c_str());
+        if (buf[0]) g_hud[i].enabled = atoi(buf) != 0;
+        sprintf_s(k, sizeof(k), "hud_%s_fx", hudNames[i]);
+        GetPrivateProfileStringA("vr", k, "", buf, sizeof(buf), ini.c_str());
+        g_hudFx[i] = buf[0] ? static_cast<float>(atof(buf)) : 0.5f;
+        sprintf_s(k, sizeof(k), "hud_%s_fy", hudNames[i]);
+        GetPrivateProfileStringA("vr", k, "", buf, sizeof(buf), ini.c_str());
+        g_hudFy[i] = buf[0] ? static_cast<float>(atof(buf)) : 0.5f;
+    }
+    if (g_hudFrame) {
+        for (int i = 0; i < 13; ++i) {
+            HudFrameAngles(i, g_hud[i].yawDeg, g_hud[i].pitchDeg);
+            // pitch set together with yaw above
+        }
+    }
+    Log("vr config: dialogue_panel=%d dist=%.2f width=%.2f y=%.2f", g_vrDlgPanel ? 1 : 0, g_vrDlgDist, g_vrDlgWidth,
+        g_vrDlgY);
     GetPrivateProfileStringA("vr", "vr_cam_states", "0,7", buf, sizeof(buf), ini.c_str());
     g_vrCamMask = 0;
     for (char* p = buf; *p;) {
@@ -794,20 +1143,643 @@ static void LoadVrConfig() {
     g_vrUpscale = atoi(buf) != 0;
     GetPrivateProfileStringA("vr", "upscale_sharpness", "0.2", buf, sizeof(buf), ini.c_str());
     g_vrUpSharp = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("vr", "head_yaw_offset_deg", "0", buf, sizeof(buf), ini.c_str());
+    g_yawOff = static_cast<float>(atof(buf)) * 0.0174532925f;
+    GetPrivateProfileStringA("vr", "head_pitch_offset_deg", "0", buf, sizeof(buf), ini.c_str());
+    g_pitchOff = static_cast<float>(atof(buf)) * 0.0174532925f;
+    GetPrivateProfileStringA("vr", "recenter_key", "35", buf, sizeof(buf), ini.c_str());  // VK_DELETE = 46
+    g_recenterKey = atoi(buf);
     Log("vr config: enabled=%d eye_delay=%d swap_eyes=%d wait_poses=%d flat_after=%d screen=%.2fm@%.2fm",
         g_vrEnabled ? 1 : 0, g_vrEyeDelay, g_vrSwap ? 1 : 0, g_vrWaitPoses ? 1 : 0, g_vrFlatAfter,
         g_vrOverlayWidth, g_vrOverlayDist);
     Log("vr config: upscale=%d sharpness=%.2f", g_vrUpscale ? 1 : 0, g_vrUpSharp);
+    Log("vr config: capture_aim_frames=%d", g_vrCaptureAimFrames);
+    Log("vr config: renderdoc_capture_key=%d", g_renderDocCaptureKey);
+    Log("vr config: yaw_off=%.2f deg pitch_off=%.2f deg recenter_key=%d",
+        g_yawOff * 57.2957795f, g_pitchOff * 57.2957795f, g_recenterKey);
+}
+
+// Yaw and pitch of a pose (OpenVR seated space: x right, y up, -z forward).
+// forward = -(column 2 of the rotation matrix); yaw = atan2(-fx, -fz), pitch = asin(fy).
+static void PoseYawPitch(const vr::HmdMatrix34_t& m, float& yaw, float& pitch) {
+    const float fx = -m.m[0][2], fy = -m.m[1][2], fz = -m.m[2][2];
+    yaw = atan2f(-fx, -fz);
+    pitch = asinf(fy < -1.0f ? -1.0f : (fy > 1.0f ? 1.0f : fy));
 }
 
 static void VrPlaceOverlay(bool pip = false) {
     if (!g_vrOverlay || g_overlay == vr::k_ulOverlayHandleInvalid) return;
     vr::HmdMatrix34_t m = {};
-    m.m[0][0] = 1.0f; m.m[1][1] = 1.0f; m.m[2][2] = 1.0f;
-    m.m[1][3] = pip ? g_vrPipHeight : 0.0f;
-    m.m[2][3] = -(pip ? g_vrPipDist : g_vrOverlayDist);  // seated space: -z is forward from the seated zero pose
+    // Rotation = yaw offset about world up, then pitch offset about the plane's
+    // own x axis, so the 2D screen follows the recentered head zero pose.
+    const float s = sinf(g_yawOff), c = cosf(g_yawOff);
+    const float s2 = sinf(g_pitchOff), c2 = cosf(g_pitchOff);
+    m.m[0][0] = c;       m.m[0][1] = s * s2;  m.m[0][2] = s * c2;
+    m.m[1][1] = c2;      m.m[1][2] = -s2;
+    m.m[2][0] = -s;      m.m[2][1] = c * s2;  m.m[2][2] = c * c2;
+    const float h = pip ? g_vrPipHeight : 0.0f;
+    const float d = pip ? g_vrPipDist : g_vrOverlayDist;
+    m.m[0][3] = -d * s;             // position rotated by the same yaw
+    m.m[1][3] = h;
+    m.m[2][3] = -d * c;             // seated space: -z is forward from the seated zero pose
     g_vrOverlay->SetOverlayTransformAbsolute(g_overlay, vr::TrackingUniverseSeated, &m);
     g_vrOverlay->SetOverlayWidthInMeters(g_overlay, pip ? g_vrPipWidth : g_vrOverlayWidth);
+}
+
+// Dialogue panel: crop of the lower-centre game frame as an HMD-relative quad slightly below the view axis.
+static void VrPlaceDialoguePanel() {
+    if (!g_vrOverlay || g_overlay == vr::k_ulOverlayHandleInvalid) return;
+    vr::HmdMatrix34_t m = {};
+    m.m[0][0] = 1.0f; m.m[1][1] = 1.0f; m.m[2][2] = 1.0f;
+    m.m[1][3] = g_vrDlgY;
+    m.m[2][3] = -g_vrDlgDist;
+    g_vrOverlay->SetOverlayTransformTrackedDeviceRelative(g_overlay, vr::k_unTrackedDeviceIndex_Hmd, &m);
+    // The crop is baked into g_dlgTex by VrDialoguePanelUpdate, so the overlay shows all of it.
+    vr::VRTextureBounds_t b = { 0.0f, 0.0f, 1.0f, 1.0f };
+    g_vrOverlay->SetOverlayTextureBounds(g_overlay, &b);
+    g_vrOverlay->SetOverlayWidthInMeters(g_overlay, g_vrDlgWidth);
+}
+
+// True while the game shows dialogue response options. They are drawn in the HUD's bright green; the
+// options region of the frame (the panel crop) is sampled every few presents through a small staging
+// copy and counted for strongly green pixels. A short hold avoids flicker. Without options (the NPC is
+// still talking) the magnified panel stays hidden instead of showing a piece of scenery.
+static bool VrDialogueOptionsVisible(ID3D11Texture2D* frame) {
+    static ID3D11Texture2D* s_stage = nullptr;
+    static UINT s_w = 0, s_h = 0;
+    static DXGI_FORMAT s_fmt = DXGI_FORMAT_UNKNOWN;
+    static unsigned s_tick = 0;
+    static int s_hold = 0;
+    if (!frame || !g_dev || !g_ctx) return false;
+    if ((s_tick++ % 8) != 0) return s_hold > 0 ? (--s_hold, true) : false;  // sample every 8th present
+
+    D3D11_TEXTURE2D_DESC d = {};
+    frame->GetDesc(&d);
+    const bool rgba = d.Format == DXGI_FORMAT_R8G8B8A8_UNORM || d.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS
+                      || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS
+                      || d.Format == DXGI_FORMAT_B8G8R8X8_UNORM || d.Format == DXGI_FORMAT_B8G8R8X8_TYPELESS
+                      || d.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    if (!rgba || d.SampleDesc.Count != 1 || d.ArraySize != 1) return s_hold > 0;
+    const UINT x0 = static_cast<UINT>(g_dlgCrop[0] * d.Width), x1 = static_cast<UINT>(g_dlgCrop[2] * d.Width);
+    const UINT y0 = static_cast<UINT>(g_dlgCrop[1] * d.Height), y1 = static_cast<UINT>(g_dlgCrop[3] * d.Height);
+    if (x1 <= x0 + 8 || y1 <= y0 + 8) return false;
+    const UINT w = x1 - x0, h = y1 - y0;
+    if (!s_stage || s_w != w || s_h != h || s_fmt != d.Format) {
+        if (s_stage) { s_stage->Release(); s_stage = nullptr; }
+        D3D11_TEXTURE2D_DESC sd = {};
+        sd.Width = w; sd.Height = h; sd.MipLevels = 1; sd.ArraySize = 1; sd.Format = d.Format;
+        sd.SampleDesc.Count = 1; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(g_dev->CreateTexture2D(&sd, nullptr, &s_stage)) || !s_stage) { s_stage = nullptr; return false; }
+        s_w = w; s_h = h; s_fmt = d.Format;
+    }
+    D3D11_BOX box = { x0, y0, 0, x1, y1, 1 };
+    g_ctx->CopySubresourceRegion(s_stage, 0, 0, 0, 0, frame, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (FAILED(g_ctx->Map(s_stage, 0, D3D11_MAP_READ, 0, &m)) || !m.pData) return s_hold > 0;
+    unsigned green = 0;
+    for (UINT y = 0; y < h; y += 2) {
+        const uint8_t* row = static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch;
+        for (UINT x = 0; x < w; x += 2) {
+            const int c0 = row[x * 4 + 0], c1 = row[x * 4 + 1], c2 = row[x * 4 + 2];
+            // channel 1 is green in both RGBA and BGRA; red/blue are the other two
+            if (c1 > 200 && c1 - c0 > 100 && c1 - c2 > 100) ++green;
+        }
+    }
+    g_ctx->Unmap(s_stage, 0);
+    static int s_lastLogged = -1;
+    const bool seen = green >= 60;
+    if (seen) s_hold = 4; else if (s_hold > 0) --s_hold;
+    const int shown = (s_hold > 0) ? 1 : 0;
+    if (shown != s_lastLogged) { Log("vr: dialogue options %s (green px=%u)", shown ? "visible" : "hidden", green); s_lastLogged = shown; }
+    return s_hold > 0;
+}
+
+static void VrResetOverlayBounds() {
+    if (!g_vrOverlay || g_overlay == vr::k_ulOverlayHandleInvalid) return;
+    vr::VRTextureBounds_t b = { 0.0f, 0.0f, 1.0f, 1.0f };
+    g_vrOverlay->SetOverlayTextureBounds(g_overlay, &b);
+    g_overlayIsDlg = false;
+}
+
+// --- Own reticle (replaces the game's crosshair; no game assets used) ---
+// A small head-locked overlay at a fixed distance (reticle_dist_m) sized to reticle_deg. The texture is
+// generated here: green ticks plus a centre dot, transparent elsewhere. Turn the game's crosshair off with
+// bCrosshairEnabled=0 in Fallout4Prefs.ini to avoid two reticles.
+static ID3D11Texture2D* MakeReticleTexture() {
+    const UINT n = 64;
+    std::vector<uint8_t> px(static_cast<size_t>(n) * n * 4, 0);
+    for (UINT y = 0; y < n; ++y) {
+        for (UINT x = 0; x < n; ++x) {
+            const int dx = static_cast<int>(x) - 32, dy = static_cast<int>(y) - 32;
+            const int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+            const bool dot = ax <= 1 && ay <= 1;
+            const bool tickV = ax <= 1 && ay >= 6 && ay <= 18;
+            const bool tickH = ay <= 1 && ax >= 6 && ax <= 18;
+            if (dot || tickV || tickH) {
+                uint8_t* p = &px[(static_cast<size_t>(y) * n + x) * 4];
+                p[0] = 40; p[1] = 255; p[2] = 40; p[3] = 255;  // B, G, R, A: bright green
+            }
+        }
+    }
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = n; d.Height = n; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    D3D11_SUBRESOURCE_DATA sd = {};
+    sd.pSysMem = px.data(); sd.SysMemPitch = n * 4;
+    ID3D11Texture2D* t = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&d, &sd, &t)) || !t) return nullptr;
+    return t;
+}
+
+static void VrReticleInit() {
+    if (g_reticleInitTried || !g_vrOverlay || !g_dev) return;
+    g_reticleInitTried = true;
+    g_reticleTex = MakeReticleTexture();
+    if (!g_reticleTex) { Log("vr: reticle texture failed"); return; }
+    const vr::VROverlayError e = g_vrOverlay->CreateOverlay("fo4stereo.reticle", "fo4stereo reticle", &g_reticleOverlay);
+    if (e != vr::VROverlayError_None) { Log("vr: reticle overlay create error %d", static_cast<int>(e)); return; }
+    vr::Texture_t t = { g_reticleTex, vr::TextureType_DirectX, vr::ColorSpace_Auto };
+    g_vrOverlay->SetOverlayTexture(g_reticleOverlay, &t);
+    const float halfRad = 0.5f * g_reticleDeg * 0.0174532925f;
+    g_vrOverlay->SetOverlayWidthInMeters(g_reticleOverlay, 2.0f * g_reticleDist * tanf(halfRad));
+    // Position on a sphere of radius reticle_dist_m around the HMD, shifted by the yaw/pitch offsets.
+    const float yaw = g_reticleYawDeg * 0.0174532925f, pitch = g_reticlePitchDeg * 0.0174532925f;
+    vr::HmdMatrix34_t m = {};
+    m.m[0][0] = 1.0f; m.m[1][1] = 1.0f; m.m[2][2] = 1.0f;
+    m.m[0][3] = g_reticleDist * sinf(yaw) * cosf(pitch);
+    m.m[1][3] = g_reticleDist * sinf(pitch);
+    m.m[2][3] = -g_reticleDist * cosf(yaw) * cosf(pitch);
+    g_vrOverlay->SetOverlayTransformTrackedDeviceRelative(g_reticleOverlay, vr::k_unTrackedDeviceIndex_Hmd, &m);
+    Log("vr: own reticle ready (dist %.2f m, %.2f deg, yaw %.1f pitch %.1f)", g_reticleDist, g_reticleDeg,
+        g_reticleYawDeg, g_reticlePitchDeg);
+}
+
+// Dialogue panel content: copy the options crop out of the eye texture, keep the bright green option
+// text as is and darken everything else to a translucent dark box. This removes the scenery behind the
+// text and makes the options read like a subtitle box. Runs each frame while the panel is shown.
+static ID3D11Texture2D* g_dlgTex = nullptr;      // shared texture the overlay displays
+static ID3D11Texture2D* g_dlgStage = nullptr;    // CPU-readable staging copy of the crop
+static UINT g_dlgTexW = 0, g_dlgTexH = 0;
+static DXGI_FORMAT g_dlgFmt = DXGI_FORMAT_UNKNOWN;
+
+static bool VrDialoguePanelUpdate(ID3D11Texture2D* src) {
+    if (!src || !g_dev || !g_ctx) return false;
+    D3D11_TEXTURE2D_DESC d = {};
+    src->GetDesc(&d);
+    if (d.SampleDesc.Count != 1) return false;
+    const UINT x0 = static_cast<UINT>(g_dlgCrop[0] * d.Width), x1 = static_cast<UINT>(g_dlgCrop[2] * d.Width);
+    const UINT y0 = static_cast<UINT>(g_dlgCrop[1] * d.Height), y1 = static_cast<UINT>(g_dlgCrop[3] * d.Height);
+    if (x1 <= x0 + 8 || y1 <= y0 + 8) return false;
+    const UINT w = x1 - x0, h = y1 - y0;
+    if (!g_dlgStage || !g_dlgTex || g_dlgTexW != w || g_dlgTexH != h || g_dlgFmt != d.Format) {
+        if (g_dlgStage) { g_dlgStage->Release(); g_dlgStage = nullptr; }
+        if (g_dlgTex) { g_dlgTex->Release(); g_dlgTex = nullptr; }
+        D3D11_TEXTURE2D_DESC sd = {};
+        sd.Width = w; sd.Height = h; sd.MipLevels = 1; sd.ArraySize = 1; sd.Format = d.Format;
+        sd.SampleDesc.Count = 1; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        D3D11_TEXTURE2D_DESC td = sd;
+        td.Usage = D3D11_USAGE_DEFAULT; td.CPUAccessFlags = 0; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        if (FAILED(g_dev->CreateTexture2D(&sd, nullptr, &g_dlgStage)) || !g_dlgStage) return false;
+        if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &g_dlgTex)) || !g_dlgTex) return false;
+        g_dlgTexW = w; g_dlgTexH = h; g_dlgFmt = d.Format;
+    }
+    const bool bgra = d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS
+                      || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || d.Format == DXGI_FORMAT_B8G8R8X8_UNORM
+                      || d.Format == DXGI_FORMAT_B8G8R8X8_TYPELESS;
+    (void)bgra;  // green is channel 1 in both orders; alpha is channel 3 in both
+    D3D11_BOX box = { x0, y0, 0, x1, y1, 1 };
+    g_ctx->CopySubresourceRegion(g_dlgStage, 0, 0, 0, 0, src, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (FAILED(g_ctx->Map(g_dlgStage, 0, D3D11_MAP_READ, 0, &m)) || !m.pData) return false;
+    std::vector<uint8_t> out(static_cast<size_t>(w) * h * 4);
+    for (UINT y = 0; y < h; ++y) {
+        const uint8_t* s = static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch;
+        uint8_t* q = out.data() + static_cast<size_t>(y) * w * 4;
+        for (UINT x = 0; x < w; ++x, s += 4, q += 4) {
+            const int c0 = s[0], c1 = s[1], c2 = s[2];
+            const bool text = c1 > 200 && c1 - c0 > 100 && c1 - c2 > 100;
+            if (text) {
+                q[0] = s[0]; q[1] = s[1]; q[2] = s[2]; q[3] = 255;
+            } else {
+                q[0] = static_cast<uint8_t>(c0 * 0.12f); q[1] = static_cast<uint8_t>(c1 * 0.12f);
+                q[2] = static_cast<uint8_t>(c2 * 0.12f); q[3] = 225;  // nearly opaque dark box: no scenery behind text
+            }
+        }
+    }
+    g_ctx->Unmap(g_dlgStage, 0);
+    g_ctx->UpdateSubresource(g_dlgTex, 0, nullptr, out.data(), w * 4, 0);
+    return true;
+}
+
+// --- HUD panels (phase 1 of docs/HUD_PLAN.md) ---
+// The game's HUD elements (HP, ammo, compass) are cropped from the eye textures, shown as head-locked
+// panels in front of the view, and masked out of the world image so they are not drawn twice.
+// Needs fHUDOpacity=1 in Fallout4Prefs.ini (the crops come from the HUD the game draws).
+static void HudCropCopy(HudPanel& p, ID3D11Texture2D* src, UINT& x0, UINT& y0, UINT& w, UINT& h, const D3D11_TEXTURE2D_DESC& d) {
+    x0 = static_cast<UINT>(p.crop[0] * d.Width);
+    y0 = static_cast<UINT>(p.crop[1] * d.Height);
+    w = static_cast<UINT>(p.crop[2] * d.Width) - x0;
+    h = static_cast<UINT>(p.crop[3] * d.Height) - y0;
+    (void)src;
+}
+
+// Copies the crop, builds the panel image (bright HUD pixels kept, background darkened), and masks the
+// same region in both eye textures.
+// Placeholder panel: the element name as green text on a dark box (used to lay out the frame).
+static ID3D11Texture2D* VrLabelTexture(const char* text) {
+    const int W = 256, H = 96;
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP hb = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!hb || !bits) { if (hb) DeleteObject(hb); DeleteDC(dc); return nullptr; }
+    HGDIOBJ oldBmp = SelectObject(dc, hb);
+    uint8_t* px = static_cast<uint8_t*>(bits);
+    for (int i = 0; i < W * H * 4; i += 4) { px[i] = 0; px[i + 1] = 0; px[i + 2] = 0; px[i + 3] = 170; }
+    HFONT font = CreateFontA(30, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(60, 255, 60));
+    TextOutA(dc, 10, 30, text, static_cast<int>(strlen(text)));
+    for (int i = 0; i < W * H * 4; i += 4) {
+        if (px[i] | px[i + 1] | px[i + 2]) px[i + 3] = 255;
+    }
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    D3D11_SUBRESOURCE_DATA sd = {};
+    sd.pSysMem = bits; sd.SysMemPitch = W * 4;
+    ID3D11Texture2D* t = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&d, &sd, &t))) t = nullptr;
+    SelectObject(dc, oldFont); DeleteObject(font);
+    SelectObject(dc, oldBmp); DeleteObject(hb); DeleteDC(dc);
+    return t;
+}
+static bool VrHudPanelUpdate(HudPanel& p, ID3D11Texture2D* src) {
+    if (g_hudPlaceholder) {
+        if (!p.tex) p.tex = VrLabelTexture(p.key + 14);
+        return p.tex != nullptr;
+    }
+    if (!src || !g_dev || !g_ctx) return false;
+    D3D11_TEXTURE2D_DESC d = {};
+    src->GetDesc(&d);
+    if (d.SampleDesc.Count != 1) return false;
+    UINT x0, y0, w, h;
+    HudCropCopy(p, src, x0, y0, w, h, d);
+    if (w < 4 || h < 4) return false;
+    if (!p.stage || !p.tex || p.w != w || p.h != h || p.fmt != d.Format) {
+        if (p.stage) { p.stage->Release(); p.stage = nullptr; }
+        if (p.tex) { p.tex->Release(); p.tex = nullptr; }
+        D3D11_TEXTURE2D_DESC sd = {};
+        sd.Width = w; sd.Height = h; sd.MipLevels = 1; sd.ArraySize = 1; sd.Format = d.Format;
+        sd.SampleDesc.Count = 1; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        D3D11_TEXTURE2D_DESC td = sd;
+        td.Usage = D3D11_USAGE_DEFAULT; td.CPUAccessFlags = 0; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        if (FAILED(g_dev->CreateTexture2D(&sd, nullptr, &p.stage)) || !p.stage) { p.stage = nullptr; return false; }
+        if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &p.tex)) || !p.tex) { p.tex = nullptr; return false; }
+        p.w = w; p.h = h; p.fmt = d.Format;
+    }
+    D3D11_BOX box = { x0, y0, 0, x0 + w, y0 + h, 1 };
+    g_ctx->CopySubresourceRegion(p.stage, 0, 0, 0, 0, src, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (FAILED(g_ctx->Map(p.stage, 0, D3D11_MAP_READ, 0, &m)) || !m.pData) return false;
+    std::vector<uint8_t> orig(static_cast<size_t>(w) * h * 4);  // untouched crop, for the world mask
+    for (UINT y = 0; y < h; ++y) {
+        memcpy(orig.data() + static_cast<size_t>(y) * w * 4, static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch, static_cast<size_t>(w) * 4);
+    }
+    std::vector<uint8_t> out(static_cast<size_t>(w) * h * 4);
+    for (UINT y = 0; y < h; ++y) {
+        const uint8_t* s = static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch;
+        uint8_t* q = out.data() + static_cast<size_t>(y) * w * 4;
+        for (UINT x = 0; x < w; ++x, s += 4, q += 4) {
+            const int c0 = s[0], c1 = s[1], c2 = s[2];
+            // HUD foreground: any bright pixel (green markers, red enemy/target marks, white items).
+            // The translucent dark HUD background is below this level.
+            const bool bright = c0 > 90 || c1 > 90 || c2 > 90;
+            if (bright) {
+                q[0] = s[0]; q[1] = s[1]; q[2] = s[2]; q[3] = 255;
+            } else {
+                q[0] = static_cast<uint8_t>(c0 * 0.3f); q[1] = static_cast<uint8_t>(c1 * 0.3f);
+                q[2] = static_cast<uint8_t>(c2 * 0.3f); q[3] = static_cast<uint8_t>(g_hudBgAlpha);
+            }
+        }
+    }
+    g_ctx->Unmap(p.stage, 0);
+    g_ctx->UpdateSubresource(p.tex, 0, nullptr, out.data(), w * 4, 0);
+    if (g_hudMask) {
+        // Replace the whole HUD region in the world image with a plain dark box (no HUD pixels kept,
+        // otherwise the HUD text would still be drawn in the world).
+        // Only the bright HUD pixels are replaced (near black). Everything else keeps the world's own pixels.
+        std::vector<uint8_t> dark(orig);
+        for (size_t i = 0; i < dark.size(); i += 4) {
+            const int c0 = orig[i], c1 = orig[i + 1], c2 = orig[i + 2];
+            if (c0 > 90 || c1 > 90 || c2 > 90) {
+                dark[i] = 0; dark[i + 1] = 0; dark[i + 2] = 0; dark[i + 3] = 255;
+            }
+        }
+        D3D11_BOX dst = { x0, y0, 0, x0 + w, y0 + h, 1 };
+        if (g_eyeTex[0]) g_ctx->UpdateSubresource(g_eyeTex[0], 0, &dst, dark.data(), w * 4, 0);
+        if (g_eyeTex[1]) g_ctx->UpdateSubresource(g_eyeTex[1], 0, &dst, dark.data(), w * 4, 0);
+    }
+    return true;
+}
+
+static void VrPlaceHudPanel(HudPanel& p) {
+    const float yaw = p.yawDeg * 0.0174532925f, pitch = p.pitchDeg * 0.0174532925f;
+    vr::HmdMatrix34_t m = {};
+    m.m[0][0] = 1.0f; m.m[1][1] = 1.0f; m.m[2][2] = 1.0f;
+    m.m[0][3] = g_hudDist * sinf(yaw) * cosf(pitch);
+    m.m[1][3] = g_hudDist * sinf(pitch);
+    m.m[2][3] = -g_hudDist * cosf(yaw) * cosf(pitch);
+    g_vrOverlay->SetOverlayTransformTrackedDeviceRelative(p.ov, vr::k_unTrackedDeviceIndex_Hmd, &m);
+    g_vrOverlay->SetOverlayWidthInMeters(p.ov, p.widthM);
+}
+
+static void VrHudPanelsFrame(bool want) {
+    for (HudPanel& p : g_hud) {
+        const bool show = want && p.enabled;
+        if (show && g_vrOverlay) {
+            if (!p.overlayTried) {
+                p.overlayTried = true;
+                if (g_vrOverlay->CreateOverlay(p.key, p.key, &p.ov) != vr::VROverlayError_None) p.ov = vr::k_ulOverlayHandleInvalid;
+            }
+            if (p.ov != vr::k_ulOverlayHandleInvalid && VrHudPanelUpdate(p, g_hudSrc) && p.tex) {
+                vr::Texture_t t = { p.tex, vr::TextureType_DirectX, vr::ColorSpace_Auto };
+                g_vrOverlay->SetOverlayTexture(p.ov, &t);
+                if (!p.shown) {
+                    VrPlaceHudPanel(p);
+                    g_vrOverlay->ShowOverlay(p.ov);
+                    p.shown = true;
+                }
+            }
+        } else if (p.shown && p.ov != vr::k_ulOverlayHandleInvalid) {
+            g_vrOverlay->HideOverlay(p.ov);
+            p.shown = false;
+        }
+    }
+}
+// --- HUD panel tuning mode (no mod needed) ---
+// Numpad 5 toggles tuning. Numpad 1/2/3 select HP/ammo/compass. Numpad 4/6 yaw, 8/2 pitch (1 degree per
+// press), Numpad + / - width (10 %). Numpad 0 saves the values to fo4stereo.ini. Only the proxy reads
+// these keys; the game gets them too, so keep tuning to a menu-free moment.
+static bool KeyPressedEdge(int vk) {
+    static bool s_down[256] = {};
+    const bool d = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    const bool edge = d && !s_down[vk & 255];
+    s_down[vk & 255] = d;
+    return edge;
+}
+
+static bool g_tuneOn = false;
+static int g_tuneSel = 0;
+static int g_tuneMode = 0;   // 0 element, 1 crop, 2 frame edges
+
+// On-screen help and values for tuning: a small text panel in the centre of the view, drawn with GDI into
+// a texture (dark box, green text). Re-rendered only when the selection or a value changes.
+static const int kTuneCount = 13;
+static const char* const kTuneNames[kTuneCount] = { "hp", "ammo", "compass", "effects", "location", "notify", "prompt", "explosive", "crit", "ap", "rads", "flash", "enemy" };
+static vr::VROverlayHandle_t g_tuneOv = vr::k_ulOverlayHandleInvalid;
+static bool g_tuneOvTried = false, g_tuneOvShown = false;
+static ID3D11Texture2D* g_tuneTex = nullptr;
+static struct { int sel; float y, p, w, h; int mode; } g_tuneLast = { -1, 0.0f, 0.0f, 0.0f, 0.0f, -1 };
+
+// Tuning view: only the frame outline (its edges) and the controls. Nothing else is shown while tuning.
+static ID3D11Texture2D* VrTuneRender() {
+    const float tw = tanf(0.5f * g_frameWDeg * 0.0174532925f), th = tanf(0.5f * g_frameHDeg * 0.0174532925f);
+    int W = 512;
+    int H = static_cast<int>(512.0f * (th / (tw > 0.0001f ? tw : 0.0001f)) + 0.5f);
+    if (H < 64) H = 64;
+    if (H > 2048) H = 2048;
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP hb = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!hb || !bits) { if (hb) DeleteObject(hb); DeleteDC(dc); return nullptr; }
+    HGDIOBJ oldBmp = SelectObject(dc, hb);
+    uint8_t* px = static_cast<uint8_t*>(bits);
+    for (int i = 0; i < W * H * 4; i += 4) { px[i] = 0; px[i + 1] = 0; px[i + 2] = 0; px[i + 3] = 0; }
+    HPEN pen = CreatePen(PS_SOLID, 5, RGB(60, 255, 60));
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, 3, 3, W - 3, H - 3);
+    HFONT font = CreateFontA(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, OPAQUE);
+    SetBkColor(dc, RGB(0, 0, 0));
+    SetTextColor(dc, RGB(60, 255, 60));
+    const float L = g_frameYaw - g_frameWDeg * 0.5f, R = g_frameYaw + g_frameWDeg * 0.5f;
+    const float T = g_framePitch + g_frameHDeg * 0.5f, B = g_framePitch - g_frameHDeg * 0.5f;
+    const char* modeName = g_tuneMode == 2 ? "FRAME" : (g_tuneMode == 1 ? "CROP" : "ELEMENT");
+    char lines[5][96];
+    sprintf_s(lines[0], sizeof(lines[0]), "TUNING [%s]  (5 off, 7 mode, 0 save)", modeName);
+    sprintf_s(lines[1], sizeof(lines[1]), "left %.1f   right %.1f deg", L, R);
+    sprintf_s(lines[2], sizeof(lines[2]), "top %.1f   bottom %.1f deg", T, B);
+    sprintf_s(lines[3], sizeof(lines[3]), "4/6 left   9/3 right");
+    sprintf_s(lines[4], sizeof(lines[4]), "8/2 top / bottom");
+    for (int i = 0; i < 5; ++i) TextOutA(dc, 14, 12 + i * 30, lines[i], static_cast<int>(strlen(lines[i])));
+    for (int i = 0; i < W * H * 4; i += 4) {
+        if (px[i] | px[i + 1] | px[i + 2]) px[i + 3] = 255;
+    }
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    D3D11_SUBRESOURCE_DATA sd = {};
+    sd.pSysMem = bits; sd.SysMemPitch = W * 4;
+    ID3D11Texture2D* t = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&d, &sd, &t))) t = nullptr;
+    SelectObject(dc, oldFont); DeleteObject(font);
+    SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(pen);
+    SelectObject(dc, oldBmp); DeleteObject(hb); DeleteDC(dc);
+    return t;
+}
+static void VrTuneOverlayFrame() {
+    if (!g_vrOverlay || !g_dev) return;
+    if (!g_tuneOn) {
+        if (g_tuneOvShown && g_tuneOv != vr::k_ulOverlayHandleInvalid) { g_vrOverlay->HideOverlay(g_tuneOv); g_tuneOvShown = false; }
+        return;
+    }
+    if (g_tuneOv == vr::k_ulOverlayHandleInvalid && !g_tuneOvTried) {
+        g_tuneOvTried = true;
+        if (g_vrOverlay->CreateOverlay("fo4stereo.tune", "fo4stereo tune", &g_tuneOv) != vr::VROverlayError_None)
+            g_tuneOv = vr::k_ulOverlayHandleInvalid;
+    }
+    if (g_tuneOv == vr::k_ulOverlayHandleInvalid) return;
+    const bool changed = g_tuneLast.sel != g_tuneSel || g_tuneLast.y != g_frameYaw || g_tuneLast.p != g_framePitch
+                         || g_tuneLast.w != g_frameWDeg || g_tuneLast.h != g_frameHDeg || !g_tuneTex || g_tuneLast.mode != g_tuneMode;
+    if (changed) {
+        if (ID3D11Texture2D* t = VrTuneRender()) {
+            if (g_tuneTex) g_tuneTex->Release();
+            g_tuneTex = t;
+        }
+        g_tuneLast.sel = g_tuneSel; g_tuneLast.y = g_frameYaw; g_tuneLast.p = g_framePitch;
+        g_tuneLast.w = g_frameWDeg; g_tuneLast.h = g_frameHDeg; g_tuneLast.mode = g_tuneMode;
+        if (g_tuneTex) {
+            vr::Texture_t tt = { g_tuneTex, vr::TextureType_DirectX, vr::ColorSpace_Auto };
+            g_vrOverlay->SetOverlayTexture(g_tuneOv, &tt);
+        }
+        // place the outline at the frame centre, 2.5 m away, sized to the frame's horizontal angle
+        const float D = 2.5f;
+        const float yaw = g_frameYaw * 0.0174532925f, pitch = g_framePitch * 0.0174532925f;
+        vr::HmdMatrix34_t m = {};
+        m.m[0][0] = 1.0f; m.m[1][1] = 1.0f; m.m[2][2] = 1.0f;
+        m.m[0][3] = D * sinf(yaw) * cosf(pitch);
+        m.m[1][3] = D * sinf(pitch);
+        m.m[2][3] = -D * cosf(yaw) * cosf(pitch);
+        g_vrOverlay->SetOverlayTransformTrackedDeviceRelative(g_tuneOv, vr::k_unTrackedDeviceIndex_Hmd, &m);
+        g_vrOverlay->SetOverlayWidthInMeters(g_tuneOv, 2.0f * D * tanf(0.5f * g_frameWDeg * 0.0174532925f));
+    }
+    if (!g_tuneOvShown) { g_vrOverlay->ShowOverlay(g_tuneOv); g_tuneOvShown = true; }
+}
+
+// Recomputes every element's angles from the frame (centre/size) and its normalised position in it.
+static void VrApplyFrame() {
+    for (int i = 0; i < 13; ++i) {
+        HudFrameAngles(i, g_hud[i].yawDeg, g_hud[i].pitchDeg);
+        // pitch set together with yaw above
+        if (g_hud[i].shown && g_hud[i].ov != vr::k_ulOverlayHandleInvalid) VrPlaceHudPanel(g_hud[i]);
+    }
+}
+
+static void VrTuningSave() {
+    const std::string path = g_iniPath.empty() ? GameDir() + "fo4stereo.ini" : g_iniPath;
+    for (int i = 0; i < kTuneCount; ++i) {
+        char v[64], k[80];
+        sprintf_s(k, sizeof(k), "hud_%s_enabled", kTuneNames[i]);
+        WritePrivateProfileStringA("vr", k, g_hud[i].enabled ? "1" : "0", path.c_str());
+        sprintf_s(k, sizeof(k), "hud_%s_crop", kTuneNames[i]);
+        sprintf_s(v, sizeof(v), "%.3f,%.3f,%.3f,%.3f", g_hud[i].crop[0], g_hud[i].crop[1], g_hud[i].crop[2], g_hud[i].crop[3]);
+        WritePrivateProfileStringA("vr", k, v, path.c_str());
+        sprintf_s(k, sizeof(k), "hud_%s_width_m", kTuneNames[i]);
+        sprintf_s(v, sizeof(v), "%.3f", g_hud[i].widthM);
+        WritePrivateProfileStringA("vr", k, v, path.c_str());
+        sprintf_s(k, sizeof(k), "hud_%s_fx", kTuneNames[i]);
+        sprintf_s(v, sizeof(v), "%.3f", g_hudFx[i]);
+        WritePrivateProfileStringA("vr", k, v, path.c_str());
+        sprintf_s(k, sizeof(k), "hud_%s_fy", kTuneNames[i]);
+        sprintf_s(v, sizeof(v), "%.3f", g_hudFy[i]);
+        WritePrivateProfileStringA("vr", k, v, path.c_str());
+    }
+    char v[64];
+    // Save the frame as its screen edges (these are what the proxy uses).
+    const float fL = g_frameYaw - g_frameWDeg * 0.5f, fR = g_frameYaw + g_frameWDeg * 0.5f;
+    const float fT = g_framePitch + g_frameHDeg * 0.5f, fB = g_framePitch - g_frameHDeg * 0.5f;
+    sprintf_s(v, sizeof(v), "%.2f", fL); WritePrivateProfileStringA("vr", "hud_frame_left_deg", v, path.c_str());
+    sprintf_s(v, sizeof(v), "%.2f", fR); WritePrivateProfileStringA("vr", "hud_frame_right_deg", v, path.c_str());
+    sprintf_s(v, sizeof(v), "%.2f", fT); WritePrivateProfileStringA("vr", "hud_frame_top_deg", v, path.c_str());
+    sprintf_s(v, sizeof(v), "%.2f", fB); WritePrivateProfileStringA("vr", "hud_frame_bottom_deg", v, path.c_str());
+    Log("vr: tuning saved to %s", path.c_str());
+}
+
+static void VrTuningFrame() {
+    if (KeyPressedEdge(VK_NUMPAD5)) {
+        g_tuneOn = !g_tuneOn;
+        Log("vr: tuning %s", g_tuneOn ? "ON" : "OFF");
+    }
+    if (!g_tuneOn) return;
+    if (KeyPressedEdge(VK_NUMPAD7)) { g_tuneMode = (g_tuneMode + 1) % 3; Log("vr: tune mode %d", g_tuneMode); }
+    bool changed = false;
+    if (g_tuneMode == 2) {
+        // frame edges: left/right/top/bottom in degrees
+        float L = g_frameYaw - g_frameWDeg * 0.5f, R = g_frameYaw + g_frameWDeg * 0.5f;
+        float T = g_framePitch + g_frameHDeg * 0.5f, B = g_framePitch - g_frameHDeg * 0.5f;
+        if (KeyPressedEdge(VK_NUMPAD4)) { L -= 1.0f; changed = true; }
+        if (KeyPressedEdge(VK_NUMPAD6)) { L += 1.0f; changed = true; }
+        if (KeyPressedEdge(VK_NUMPAD9)) { R += 1.0f; changed = true; }
+        if (KeyPressedEdge(VK_NUMPAD3)) { R -= 1.0f; changed = true; }
+        if (KeyPressedEdge(VK_NUMPAD8)) { T += 1.0f; changed = true; }
+        if (KeyPressedEdge(VK_NUMPAD2)) { B -= 1.0f; changed = true; }
+        if (changed) {
+            g_frameYaw = (L + R) * 0.5f; g_frameWDeg = R - L;
+            g_framePitch = (T + B) * 0.5f; g_frameHDeg = T - B;
+            VrApplyFrame();
+        }
+    } else {
+        if (KeyPressedEdge(VK_NUMPAD1)) g_tuneSel = (g_tuneSel + kTuneCount - 1) % kTuneCount;
+        if (KeyPressedEdge(VK_NUMPAD9)) g_tuneSel = (g_tuneSel + 1) % kTuneCount;
+        HudPanel& p = g_hud[g_tuneSel];
+        if (KeyPressedEdge(VK_NUMPAD3)) { p.enabled = !p.enabled; changed = true; }
+        if (g_tuneMode == 1) {
+            const float d = 0.01f;
+            float dx = 0.0f, dy = 0.0f;
+            if (KeyPressedEdge(VK_NUMPAD4)) dx -= d;
+            if (KeyPressedEdge(VK_NUMPAD6)) dx += d;
+            if (KeyPressedEdge(VK_NUMPAD8)) dy -= d;
+            if (KeyPressedEdge(VK_NUMPAD2)) dy += d;
+            if (dx != 0.0f || dy != 0.0f) {
+                float u0 = p.crop[0] + dx, u1 = p.crop[2] + dx, v0 = p.crop[1] + dy, v1 = p.crop[3] + dy;
+                if (u0 >= 0.0f && u1 <= 1.0f) { p.crop[0] = u0; p.crop[2] = u1; }
+                if (v0 >= 0.0f && v1 <= 1.0f) { p.crop[1] = v0; p.crop[3] = v1; }
+                changed = true;
+            }
+        } else {
+            const float d = 0.005f;
+            if (KeyPressedEdge(VK_NUMPAD4)) { g_hudFx[g_tuneSel] -= d; changed = true; }
+            if (KeyPressedEdge(VK_NUMPAD6)) { g_hudFx[g_tuneSel] += d; changed = true; }
+            if (KeyPressedEdge(VK_NUMPAD8)) { g_hudFy[g_tuneSel] -= d; changed = true; }
+            if (KeyPressedEdge(VK_NUMPAD2)) { g_hudFy[g_tuneSel] += d; changed = true; }
+            if (changed) VrApplyFrame();
+        }
+        if (changed && p.ov != vr::k_ulOverlayHandleInvalid) VrPlaceHudPanel(p);
+    }
+    // Whole-HUD zoom (any mode): frame size and every element width scale together, so the layout keeps its shape.
+    {
+        const bool zin = KeyPressedEdge(VK_ADD), zout = KeyPressedEdge(VK_SUBTRACT);
+        if (zin || zout) {
+            const float f = zin ? 1.1f : (1.0f / 1.1f);
+            g_frameWDeg *= f; g_frameHDeg *= f;
+            for (int i = 0; i < kTuneCount; ++i) g_hud[i].widthM *= f;
+            VrApplyFrame();
+            Log("vr: HUD zoom x%.3f (frame %.1f x %.1f deg)", f, g_frameWDeg, g_frameHDeg);
+        }
+    }
+    if (KeyPressedEdge(VK_NUMPAD0)) VrTuningSave();
+}
+
+// Gamepad recenter combo: both thumb-stick clicks (L3 + R3) held on controller 0. XInput is
+// loaded dynamically (no link dependency); minimal local struct layouts.
+static bool PadRecenterCombo() {
+    struct Pad { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; };
+    struct State { DWORD packet; Pad pad; };
+    using GetStateFn = DWORD(WINAPI*)(DWORD, State*);
+    static GetStateFn fn = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE x = LoadLibraryA("xinput1_4.dll");
+        if (!x) x = LoadLibraryA("xinput9_1_0.dll");
+        if (x) fn = reinterpret_cast<GetStateFn>(GetProcAddress(x, "XInputGetState"));
+    }
+    if (!fn) return false;
+    State st = {};
+    if (fn(0, &st) != ERROR_SUCCESS) return false;
+    return (st.pad.buttons & 0x0040) && (st.pad.buttons & 0x0080);  // THUMB_LEFT + THUMB_RIGHT
+}
+
+// ADS view as an HMD-relative (head-locked) quad straight ahead. The quad spans exactly the
+// game's projected field of view: width = 2 * tanX * distance, so angular size matches the
+// scene (aspect comes from the texture).
+static void VrPlaceAdsOverlay() {
+    if (!g_vrOverlay || g_overlay == vr::k_ulOverlayHandleInvalid) return;
+    vr::HmdMatrix34_t m = {};
+    m.m[0][0] = 1.0f; m.m[1][1] = 1.0f; m.m[2][2] = 1.0f;
+    m.m[2][3] = -g_vrAdsOverlayDist;
+    g_vrOverlay->SetOverlayTransformTrackedDeviceRelative(g_overlay, vr::k_unTrackedDeviceIndex_Hmd, &m);
+    const float tanX = (g_gameTanX > 0.2f && g_gameTanX < 3.0f) ? g_gameTanX : 1.3f;
+    g_vrOverlay->SetOverlayWidthInMeters(g_overlay, 2.0f * tanX * g_vrAdsOverlayDist);
 }
 
 
@@ -913,6 +1885,8 @@ static void VrAutoConfigure(float h, float v, uint32_t recH) {
 // and FOV to fo4stereo_hmd.txt next to the game.
 static float g_eyeTan[2][4] = {};  // l, r, t, b
 static bool g_haveEyeTan = false;
+static float g_runtimeIpdM = 0.0f;  // OpenVR Prop_UserIpdMeters_Float
+static bool g_haveRuntimeIpd = false;
 
 static void VrQueryHmdView(VRGetIfaceFn getIface) {
     vr::EVRInitError err = vr::VRInitError_None;
@@ -922,6 +1896,24 @@ static void VrQueryHmdView(VRGetIfaceFn getIface) {
     sys->GetRecommendedRenderTargetSize(&rw, &rh);
     g_hmdRecW = static_cast<UINT>(rw);
     g_hmdRecH = static_cast<UINT>(rh);
+
+    // Runtime IPD: the HMD's configured IPD in metres, adapts to the wearer.
+    // The plugin converts it to game units (ipd_units = metres * units_per_meter)
+    // when [engine] ipd_units <= 0 (auto mode).
+    vr::ETrackedPropertyError ipdErr = vr::TrackedProp_Success;
+    const float ipdM = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd,
+                                                          vr::Prop_UserIpdMeters_Float, &ipdErr);
+    if (ipdErr == vr::TrackedProp_Success && ipdM > 0.001f && ipdM < 0.2f) {
+        g_runtimeIpdM = ipdM;
+        g_haveRuntimeIpd = true;
+        Log("vr: runtime IPD %.4f m (%.1f mm)", ipdM, ipdM * 1000.0f);
+    } else {
+        Log("vr: runtime IPD unavailable (err=%d, val=%.4f), using configured ipd_units", (int)ipdErr, ipdM);
+    }
+    if (g_shm) {
+        g_shm->runtimeIpdM = g_haveRuntimeIpd ? g_runtimeIpdM : 0.0f;
+        InterlockedExchange(&g_shm->runtimeIpdValid, g_haveRuntimeIpd ? 1 : 0);
+    }
     for (int e = 0; e < 2; ++e) {
         sys->GetProjectionRaw(e == 0 ? vr::Eye_Left : vr::Eye_Right,
                               &g_eyeTan[e][0], &g_eyeTan[e][1], &g_eyeTan[e][2], &g_eyeTan[e][3]);
@@ -994,62 +1986,6 @@ static UINT g_vrInitAttempts = 0;
 static ULONGLONG g_vrNextTryMs = 0;
 
 // Retries every 10 s until SteamVR has a headset, so the HMD can be connected after the game started.
-// --- MCM live settings ------------------------------------------------------
-// The MCM core writes user settings to <game>\Data\MCM\Settings\F4Flat2VR.ini
-// (same file the F4SE plugin watches). Read it directly here as well: it is the
-// reliable path into the proxy and does not depend on the plugin being present.
-// Gate on the file's last-write time; apply only on change.
-static void VrApplyMcm()
-{
-    static char s_path[MAX_PATH] = "";
-    static FILETIME s_write{};
-    static bool s_have = false;
-    if (!s_path[0]) {
-        char dir[MAX_PATH];
-        GetModuleFileNameA(nullptr, dir, MAX_PATH);
-        char* slash = strrchr(dir, '\\');
-        if (slash) *(slash + 1) = '\0';
-        snprintf(s_path, MAX_PATH, "%sData\\MCM\\Settings\\F4Flat2VR.ini", dir);
-    }
-    WIN32_FILE_ATTRIBUTE_DATA d{};
-    if (!GetFileAttributesExA(s_path, GetFileExInfoStandard, &d)) return;
-    if (s_have && d.ftLastWriteTime.dwLowDateTime == s_write.dwLowDateTime &&
-        d.ftLastWriteTime.dwHighDateTime == s_write.dwHighDateTime) return;
-    s_have = true;
-    s_write = d.ftLastWriteTime;
-
-    auto readF = [&](const char* key, float cur, float lo, float hi) {
-        char buf[64]{};
-        char def[32];
-        snprintf(def, sizeof(def), "%.5f", static_cast<double>(cur));
-        GetPrivateProfileStringA("VR", key, def, buf, sizeof(buf), s_path);
-        const float v = static_cast<float>(atof(buf));
-        return (v >= lo && v <= hi) ? v : cur;
-    };
-    auto readI = [&](const char* key, int cur, int lo, int hi) {
-        char buf[64]{};
-        char def[32];
-        snprintf(def, sizeof(def), "%d", cur);
-        GetPrivateProfileStringA("VR", key, def, buf, sizeof(buf), s_path);
-        const int v = atoi(buf);
-        return (v >= lo && v <= hi) ? v : cur;
-    };
-
-    g_vrEyeDelay = readI("bEyeDelay", g_vrEyeDelay, 0, 1);
-    g_vrSwap = readI("bSwapEyes", g_vrSwap ? 1 : 0, 0, 1) != 0;
-    g_vrWaitPoses = readI("bWaitPoses", g_vrWaitPoses ? 1 : 0, 0, 1) != 0;
-    g_vrAimRatio = readF("fAimRatio", g_vrAimRatio, 0.1f, 1.0f);
-    g_vrPipboyRatio = readF("fPipboyRatio", g_vrPipboyRatio, 0.1f, 1.0f);
-    g_vrOverlayWidth = readF("fScreenWidth", g_vrOverlayWidth, 0.1f, 20.0f);
-    g_vrOverlayDist = readF("fScreenDist", g_vrOverlayDist, 0.1f, 20.0f);
-    g_vrPipWidth = readF("fPipWidth", g_vrPipWidth, 0.1f, 10.0f);
-    g_vrPipDist = readF("fPipDist", g_vrPipDist, 0.1f, 10.0f);
-    g_vrUpSharp = readF("fUpSharp", g_vrUpSharp, 0.0f, 2.0f);
-    Log("vr mcm: eyeDelay=%d swap=%d waitPoses=%d sharp=%.2f ratios %.2f/%.2f screen %.1fm@%.1fm pip %.1fm@%.1fm",
-        g_vrEyeDelay, g_vrSwap ? 1 : 0, g_vrWaitPoses ? 1 : 0, g_vrUpSharp, g_vrAimRatio, g_vrPipboyRatio,
-        g_vrOverlayWidth, g_vrOverlayDist, g_vrPipWidth, g_vrPipDist);
-}
-
 static void VrInitOnce() {
     if (!g_vrTried) {
         g_vrTried = true;
@@ -1200,9 +2136,33 @@ static void VrEnsureTextures(ID3D11Texture2D* bb) {
 }
 
 // HMD pose (seated space) -> shared memory, for the plugin's head tracking.
+// Applies the head view offsets directly to a pose matrix:
+// R' = Ry(yawOff) * R * Rx(pitchOff) (pitch about the head's own right axis, yaw about
+// world up), then the position is rotated by the yaw offset. Doing it on the matrix
+// keeps the existing quaternion extraction untouched.
+static void ApplyHeadOffsets(vr::HmdMatrix34_t& m) {
+    if (g_yawOff == 0.0f && g_pitchOff == 0.0f) return;
+    const float c = cosf(g_yawOff), s = sinf(g_yawOff);
+    const float c2 = cosf(g_pitchOff), s2 = sinf(g_pitchOff);
+    // R * Rx(pitchOff): rotate columns 1..2 (local pitch about the head's right axis)
+    for (int r = 0; r < 3; ++r) {
+        const float y = m.m[r][1], z = m.m[r][2];
+        m.m[r][1] = y * c2 + z * s2;
+        m.m[r][2] = -y * s2 + z * c2;
+    }
+    // Ry(yawOff) * R: mix rows 0 and 2 (world up yaw)
+    for (int cix = 0; cix < 4; ++cix) {
+        const float x = m.m[0][cix], z = m.m[2][cix];
+        m.m[0][cix] = x * c + z * s;
+        m.m[2][cix] = -x * s + z * c;
+    }
+}
+
 static void VrWritePose(const vr::TrackedDevicePose_t& p) {
     if (!g_shm) return;
-    const auto& m = p.mDeviceToAbsoluteTracking.m;
+    vr::TrackedDevicePose_t pose = p;  // local copy: ApplyHeadOffsets edits the matrix
+    if (pose.bPoseIsValid) ApplyHeadOffsets(pose.mDeviceToAbsoluteTracking);
+    const auto& m = pose.mDeviceToAbsoluteTracking.m;
     float q[4];
     const float tr = m[0][0] + m[1][1] + m[2][2];
     if (tr > 0.0f) {
@@ -1663,35 +2623,151 @@ static void DrawOverlayCursor(ID3D11Texture2D* dst) {
     g_ctx->UpdateSubresource(dst, 0, &box, px.data(), w * 4, 0);
 }
 
+// Capture-key fallback (RenderDoc not loaded): save what is being shown as BMP files into
+// <game>\fo4stereo_shots\: both eye textures in 3D mode, the 2D screen texture in 2D mode, tagged
+// with camera state / zoom so HUD and dialogue frames can be inspected offline.
+static void SaveShotFallback(bool flat, LONG camState) {
+    const std::string dir = GameDir() + "fo4stereo_shots";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char stamp[64];
+    sprintf_s(stamp, sizeof(stamp), "%04d%02d%02d_%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour,
+              st.wMinute, st.wSecond);
+    const LONG zoom = g_shm ? g_shm->zoom : -1;
+    char tag[96];
+    sprintf_s(tag, sizeof(tag), "%s_cam%ld_zoom%ld_%s", stamp, camState, zoom, flat ? "2D" : (g_monoAim ? "ads" : "3D"));
+    const std::string stem = dir + "\\" + tag;
+    bool ok = false;
+    if (flat) {
+        ok = SaveTextureBmp(g_flatTex, stem + "_screen.bmp");
+    } else {
+        const bool l = SaveTextureBmp(g_eyeTex[0], stem + "_left.bmp");
+        const bool r = SaveTextureBmp(g_eyeTex[1], stem + "_right.bmp");
+        ok = l || r;
+    }
+    Log("vr: screenshot %s -> %s (flat=%d camState=%ld zoom=%ld)", ok ? "saved" : "FAILED", stem.c_str(),
+        flat ? 1 : 0, camState, zoom);
+}
+
+#if FO4STEREO_HAS_RENDERDOC_API
+static RENDERDOC_API_1_6_0* g_renderDocApi = nullptr;
+static bool g_renderDocCaptureActive = false;
+static bool g_renderDocWildcardCapture = false;
+static LONG g_renderDocStartFrame = -1;
+static std::string g_renderDocCaptureLabel;
+
+static bool InitRenderDocApi() {
+    if (g_renderDocApi) return true;
+    HMODULE module = GetModuleHandleA("renderdoc.dll");
+    if (!module) {
+        Log("renderdoc: API is not loaded; launch with capture_renderdoc.ps1");
+        return false;
+    }
+    auto getApi = reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(module, "RENDERDOC_GetAPI"));
+    void* api = nullptr;
+    if (!getApi || !getApi(eRENDERDOC_API_Version_1_6_0, &api) || !api) {
+        Log("renderdoc: API 1.6.0 is unavailable");
+        return false;
+    }
+
+    char modulePath[MAX_PATH] = {};
+    GetModuleFileNameA(module, modulePath, MAX_PATH);
+    int major = 0, minor = 0, patch = 0;
+    auto* renderDocApi = static_cast<RENDERDOC_API_1_6_0*>(api);
+    renderDocApi->GetAPIVersion(&major, &minor, &patch);
+    const std::string outputDir = GameDir() + "fo4stereo_renderdoc";
+    DWORD attrs = GetFileAttributesA(outputDir.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        if (!CreateDirectoryA(outputDir.c_str(), nullptr)) {
+            Log("renderdoc: cannot create output directory %s (error=%lu)",
+                outputDir.c_str(), GetLastError());
+            return false;
+        }
+    } else if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        Log("renderdoc: output path is not a directory: %s", outputDir.c_str());
+        return false;
+    }
+
+    g_renderDocApi = renderDocApi;
+    Log("renderdoc: API ready version=%d.%d.%d module=%s output=%s",
+        major, minor, patch, modulePath, outputDir.c_str());
+    return true;
+}
+
+static void HandleRenderDocCapture(bool flat, LONG camState) {
+    static bool keyWasDown = false;
+    bool keyDown = false;
+    if (g_renderDocCaptureKey > 0) {
+        const SHORT ks = GetAsyncKeyState(g_renderDocCaptureKey);
+        keyDown = (ks & 0x8000) != 0 || (ks & 0x0001) != 0;  // held, or tapped since the last call
+    }
+    const bool pressed = keyDown && !keyWasDown;
+    keyWasDown = keyDown;
+    if (pressed) Log("vr: capture key %d pressed (flat=%d camState=%ld)", g_renderDocCaptureKey, flat ? 1 : 0, camState);
+
+    if (g_renderDocCaptureActive && g_frames > g_renderDocStartFrame) {
+        const uint32_t saved = g_renderDocWildcardCapture
+            ? g_renderDocApi->EndFrameCapture(nullptr, nullptr)
+            : g_renderDocApi->EndFrameCapture(g_dev, g_gameHwnd);
+        Log("renderdoc: capture complete label=%s saved=%u",
+            g_renderDocCaptureLabel.c_str(), saved);
+        g_renderDocCaptureActive = false;
+        g_renderDocWildcardCapture = false;
+        g_renderDocCaptureLabel.clear();
+    }
+    if (!pressed) return;
+    if (!g_dev || !g_gameHwnd) return;
+    // RenderDoc not loaded (the normal case: it cannot be injected while this proxy is d3d11.dll):
+    // fall back to saving BMP screenshots of the eye / 2D-screen textures. Works in any camera state.
+    if (!g_renderDocApi && !GetModuleHandleA("renderdoc.dll")) {
+        SaveShotFallback(flat, camState);
+        return;
+    }
+    if (!InitRenderDocApi()) { SaveShotFallback(flat, camState); return; }
+    if (g_renderDocApi->IsFrameCapturing()) {
+        Log("renderdoc: capture key ignored because another capture is active");
+        return;
+    }
+
+    const char* label = g_monoAim ? "ADS" : "hipfire";
+    const std::string outputTemplate = GameDir() + "fo4stereo_renderdoc\\fo4stereo_" + label;
+    g_renderDocApi->SetCaptureFilePathTemplate(outputTemplate.c_str());
+    g_renderDocApi->SetActiveWindow(g_dev, g_gameHwnd);
+    g_renderDocApi->StartFrameCapture(g_dev, g_gameHwnd);
+    if (!g_renderDocApi->IsFrameCapturing()) {
+        Log("renderdoc: exact device/window capture unavailable; trying wildcard");
+        g_renderDocApi->StartFrameCapture(nullptr, nullptr);
+        if (!g_renderDocApi->IsFrameCapturing()) {
+            Log("renderdoc: StartFrameCapture did not start (label=%s)", label);
+            return;
+        }
+        g_renderDocWildcardCapture = true;
+    }
+    g_renderDocCaptureLabel = label;
+    g_renderDocStartFrame = g_frames;
+    g_renderDocCaptureActive = true;
+    g_renderDocApi->SetCaptureTitle(label);
+    Log("renderdoc: capture started label=%s template=%s", label, outputTemplate.c_str());
+}
+#else
+static void HandleRenderDocCapture(bool flat, LONG camState) {
+    static bool keyWasDown = false;
+    bool keyDown = false;
+    if (g_renderDocCaptureKey > 0) {
+        const SHORT ks = GetAsyncKeyState(g_renderDocCaptureKey);
+        keyDown = (ks & 0x8000) != 0 || (ks & 0x0001) != 0;
+    }
+    if (keyDown && !keyWasDown) {
+        Log("vr: capture key %d pressed (flat=%d camState=%ld)", g_renderDocCaptureKey, flat ? 1 : 0, camState);
+        if (g_dev) SaveShotFallback(flat, camState);
+    }
+    keyWasDown = keyDown;
+}
+#endif
+
 static void VrOnPresent(IDXGISwapChain* sc) {
     VrInitOnce();
-    // Live settings, two paths into the same values: the MCM file read directly
-    // (mtime-gated) and the plugin's shared settings block. Applied here before
-    // anything below uses them; upscale on/off is not live (texture sizing
-    // happens at init), only its sharpness is.
-    VrApplyMcm();
-    if (g_shm) {
-        StereoSettings c{};
-        if (ReadStereoSettings(&g_shm->cfg, &c)) {
-            static LONG s_cfgSeq = -1;
-            if (c.seq != s_cfgSeq) {
-                s_cfgSeq = c.seq;
-                g_vrEyeDelay = static_cast<int>(c.eyeDelay);
-                g_vrSwap = c.swapEyes != 0;
-                g_vrWaitPoses = c.waitPoses != 0;
-                g_vrAimRatio = c.aimRatio;
-                g_vrPipboyRatio = c.pipboyRatio;
-                g_vrOverlayWidth = c.screenWidthM;
-                g_vrOverlayDist = c.screenDistanceM;
-                g_vrPipWidth = c.pipWidthM;
-                g_vrPipDist = c.pipDistanceM;
-                g_vrUpSharp = c.upscaleSharpness;
-                Log("vr cfg: eyeDelay=%d swap=%d waitPoses=%d sharp=%.2f ratios %.2f/%.2f screen %.1fm@%.1fm pip %.1fm@%.1fm",
-                    g_vrEyeDelay, g_vrSwap ? 1 : 0, g_vrWaitPoses ? 1 : 0, g_vrUpSharp, g_vrAimRatio,
-                    g_vrPipboyRatio, g_vrOverlayWidth, g_vrOverlayDist, g_vrPipWidth, g_vrPipDist);
-            }
-        }
-    }
     // Frames presented before this one; the plugin picked this frame's eye from the same count.
     const LONG count = g_shm ? InterlockedIncrement(&g_shm->presents) - 1 : static_cast<LONG>(g_vrSubmits);
     if (!g_vrComp || !g_dev || !g_ctx) return;
@@ -1715,16 +2791,23 @@ static void VrOnPresent(IDXGISwapChain* sc) {
     else if (g_seqStill < 1000000) g_seqStill++;
     // Zoom from the game projection: aiming narrows the FOV a little, the Pip-Boy a lot.
     LONG zoom = 0;
+    // Engine-side aim flag from the plugin (PlayerCamera fovAdjust). It is exact and
+    // one frame earlier than the projection heuristic: a heavy scope zoom narrows the
+    // FOV below pipboy_ratio, which would flip the view to the 2D screen - the flag
+    // keeps scope aiming in the VR view (mono). The Pip-Boy check below still wins.
+    const bool pluginAim = g_shm && g_shm->aim == 1;
     if (g_coverH > 0.0f && g_gameTanX > 0.0f) {
         const float r = g_gameTanX / g_coverH;
         // Order matters: aim_ratio is checked first (narrower FOV), then pipboy_ratio.
         // If aim_ratio were checked last, the wider Pip-Boy threshold would
         // shadow it and no eye would ever be marked as aiming.
-        zoom = r < g_vrAimRatio ? 1 : (r < g_vrPipboyRatio ? 2 : 0);
+        zoom = (pluginAim || r < g_vrAimRatio) ? 1 : (r < g_vrPipboyRatio ? 2 : 0);
         // Hysteresis: the ADS FOV animates through the threshold and back, which
         // flickered the mono/full-IPD switch (double-vision flashes while aiming).
         // Enter below aim_ratio, hold until aim_ratio + 0.015.
         if (zoom == 0 && g_zoomPrev == 1 && r < g_vrAimRatio + 0.015f) zoom = 1;
+    } else if (pluginAim) {
+        zoom = 1;
     }
     // A narrow FOV is the Pip-Boy only if the game drew into its Pip-Boy target this frame;
     // otherwise (VATS zoom, third-person aim, scopes) treat it as aiming.
@@ -1737,6 +2820,31 @@ static void VrOnPresent(IDXGISwapChain* sc) {
     if (zoom == 2 && g_vrPipProjected && g_pipEverDrawn && !pipDrawn) zoom = 1;
     const LONG camState = g_shm ? g_shm->camState : 0;
     if (g_shm) InterlockedExchange(&g_shm->zoom, zoom);
+    // Calibration: track the min/max game-projection ratio seen in a ~5 s window so a
+    // single play session (hipfire + a few ADS holds) reveals the real ADS ratio and
+    // the correct aim_ratio threshold, without RenderDoc. Logs on change only.
+    {
+        static float s_rMin = 1e9f, s_rMax = -1e9f;
+        static ULONGLONG s_winStart = 0, s_lastAds = 0;
+        const float rNow = g_coverH > 0.0f && g_gameTanX > 0.0f ? g_gameTanX / g_coverH : -1.0f;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (s_winStart == 0) s_winStart = nowMs;
+        if (rNow > 0.0f) {
+            if (rNow < s_rMin) s_rMin = rNow;
+            if (rNow > s_rMax) s_rMax = rNow;
+        }
+        // Log the moment the ratio dips into "possible ADS" territory (< 1.0 = narrower than headset).
+        if (rNow > 0.0f && rNow < 0.985f && (nowMs - s_lastAds) > 400) {
+            s_lastAds = nowMs;
+            Log("vr: CAL ratio=%.4f (tan %.3f) -> ADS candidate (aim_ratio now %.2f)", rNow, g_gameTanX, g_vrAimRatio);
+        }
+        if (nowMs - s_winStart >= 5000) {
+            if (s_rMin < 1e8f) {
+                Log("vr: CAL 5s window ratio min=%.4f max=%.4f", s_rMin, s_rMax);
+            }
+            s_rMin = 1e9f; s_rMax = -1e9f; s_winStart = nowMs;
+        }
+    }
     if (zoom != g_zoomPrev || camState != g_camStatePrev) {
         Log("vr: zoom=%ld (game tan x=%.3f, ratio %.3f) camState=%ld", zoom, g_gameTanX,
             g_coverH > 0.0f ? g_gameTanX / g_coverH : 0.0f, camState);
@@ -1754,7 +2862,20 @@ static void VrOnPresent(IDXGISwapChain* sc) {
     // Mono aim = first-person aim: the plugin renders both frames from the same
     // offset (g_shm->zoom is exactly the value the plugin uses for aimFp), so the
     // eye bounds must collapse to one shared window (VrEyeBounds).
-    g_monoAim = !flat && zoom == 1 && camState == 0;
+    // Live ADS presentation switch (Insert): 1 head-locked overlay -> 2 stereo like hipfire -> 0 mono eye
+    // textures -> 1 ... Lets one play session compare the variants when diagnosing the aim double image.
+    {
+        static bool s_insDown = false;
+        const SHORT ks = GetAsyncKeyState(VK_INSERT);
+        const bool down = (ks & 0x8000) != 0 || (ks & 0x0001) != 0;
+        if (down && !s_insDown) {
+            g_adsMode = (g_adsMode + 1) % 3;
+            Log("vr: ADS mode -> %ld (0 mono eye textures, 1 head-locked overlay, 2 stereo like hipfire)", g_adsMode);
+        }
+        s_insDown = down;
+        if (g_shm) InterlockedExchange(&g_shm->adsMode, g_adsMode);
+    }
+    g_monoAim = !flat && zoom == 1 && camState == 0 && g_adsMode != 2;
 
     // [vr] mouse: SteamVR's dashboard takes foreground and the game stops receiving
     // mouse input (Pip-Boy UI dead, no cursor). Re-assert focus every ~2 s, but only
@@ -1811,16 +2932,199 @@ static void VrOnPresent(IDXGISwapChain* sc) {
             if (d.SampleDesc.Count > 1) g_ctx->ResolveSubresource(dst, 0, bb, 0, d.Format);
             else g_ctx->CopyResource(dst, bb);
         }
+        // Mono aim: both eyes must show the SAME newest frame. Without this the eye
+        // textures hold frames one game tick apart (the alternation history), and any
+        // head/mouse motion while aiming turns that time gap into stereo disparity -
+        // the double vision on ADS with a moving view. With identical textures both
+        // eyes see the same image regardless of eye_delay or eye parity.
+        if (!flat && g_monoAim && dst == g_eyeTex[eye]) {
+            if (ID3D11Texture2D* other = g_eyeTex[eye ^ 1]; other && other != dst) {
+                g_ctx->CopyResource(other, dst);
+            }
+        }
+        // Remember which HMD pose this content was rendered with (the plugin read the pose
+        // written by the previous present's WaitGetPoses when it built this frame).
+        if (!flat) {
+            g_eyePose[eye] = g_lastHmdPose;
+            g_eyePoseOk[eye] = g_lastHmdPoseOk;
+            if (g_monoAim) { g_eyePose[eye ^ 1] = g_lastHmdPose; g_eyePoseOk[eye ^ 1] = g_lastHmdPoseOk; }
+        }
     }
     bb->Release();
+    g_hudSrc = dst;  // this present's eye texture: freshly written, not yet masked
+
+    if (g_vrCaptureAimFrames) {
+        static int s_captureMode = -2;
+        static int s_captureStableFrames = 0;
+        static bool s_capturedHipfire = false;
+        static bool s_capturedAim = false;
+        const int captureMode = flat ? -1 : (g_monoAim ? 1 : 0);
+        if (captureMode != s_captureMode) {
+            s_captureMode = captureMode;
+            s_captureStableFrames = 0;
+        } else if (s_captureStableFrames < 150) {
+            ++s_captureStableFrames;
+        }
+
+        // Burst diagnosis (capture_aim_frames=2): after the first stable hipfire
+        // stereo frames, save 40 consecutive presents of BOTH eye textures. A
+        // single-frame BMP cannot show the monocular double image (every frame is
+        // individually clean); consecutive frames of the SAME texture can: if
+        // g_eyeTex[0] alternates left-eye/right-eye renders (eye-pairing slip),
+        // the near weapon jumps ~IPD between neighbouring frames. Offline pixel
+        // diffing of the burst then proves (or kills) the flip hypothesis.
+        static int s_burstRemaining = 0;
+        static std::string s_burstStem;
+        static unsigned s_burstFrame = 0;
+        if (g_vrCaptureAimFrames >= 2) {
+            static bool s_burstStarted = false;
+            if (!s_burstStarted && captureMode >= 0 && seq > 0 && s_captureStableFrames >= 150) {
+                s_burstStarted = true;
+                s_burstRemaining = 40;
+                s_burstFrame = 0;
+                SYSTEMTIME now = {};
+                GetLocalTime(&now);
+                char stamp[64] = {};
+                sprintf_s(stamp, sizeof(stamp), "fo4stereo_burst_%04u%02u%02u_%02u%02u%02u",
+                    now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+                s_burstStem = GameDir() + stamp;
+                Log("vr: burst capture start mode=%s seq=%ld eye=%ld frames=40 (game will hitch: 2 full-res BMP writes/frame)",
+                    captureMode == 1 ? "aim" : "hipfire", seq, eye);
+            }
+            if (s_burstRemaining > 0 && captureMode >= 0) {
+                --s_burstRemaining;
+                char frameTag[16] = {};
+                sprintf_s(frameTag, sizeof(frameTag), "_f%03u", s_burstFrame);
+                const std::string leftPath = s_burstStem + frameTag + "_left.bmp";
+                const std::string rightPath = s_burstStem + frameTag + "_right.bmp";
+                const bool leftSaved = SaveTextureBmp(g_eyeTex[0], leftPath);
+                const bool rightSaved = SaveTextureBmp(g_eyeTex[1], rightPath);
+                Log("vr: burst frame %03u eye=%ld seq=%ld left=%d right=%d",
+                    s_burstFrame++, eye, seq, leftSaved ? 1 : 0, rightSaved ? 1 : 0);
+                if (s_burstRemaining == 0) {
+                    Log("vr: burst capture complete (%u frames)", s_burstFrame);
+                }
+            }
+        } else {
+        bool& captured = captureMode == 1 ? s_capturedAim : s_capturedHipfire;
+        // seq>0 = the game camera updates are flowing; without it the hipfire capture
+        // lands on the loading screen (the first stable stereo frames are the load
+        // fade-in). 150 stable frames (~2.5 s) lets the ADS animation and TAA settle,
+        // otherwise the aim BMP catches the weapon mid-transition (motion ghost).
+        if (captureMode >= 0 && seq > 0 && s_captureStableFrames >= 150 && !captured) {
+            captured = true;
+            SYSTEMTIME now = {};
+            GetLocalTime(&now);
+            char stamp[64] = {};
+            sprintf_s(stamp, sizeof(stamp), "fo4stereo_capture_%04u%02u%02u_%02u%02u%02u_%s",
+                now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
+                captureMode == 1 ? "aim" : "hipfire");
+            const std::string stem = GameDir() + stamp;
+            const std::string leftPath = stem + "_left.bmp";
+            const std::string rightPath = stem + "_right.bmp";
+
+            vr::VRTextureBounds_t leftBounds = { 0.0f, 0.0f, 1.0f, 1.0f };
+            vr::VRTextureBounds_t rightBounds = { 0.0f, 0.0f, 1.0f, 1.0f };
+            const bool leftCropped = g_vrUseBounds && VrEyeBounds(0, leftBounds);
+            const bool rightCropped = g_vrUseBounds && VrEyeBounds(1, rightBounds);
+            const char* modeName = captureMode == 1 ? "aim" : "hipfire";
+            Log("vr: capture pair mode=%s seq=%ld eye=%ld zoom=%ld camState=%ld "
+                "left=%p bounds=%d[%.3f..%.3f,%.3f..%.3f] "
+                "right=%p bounds=%d[%.3f..%.3f,%.3f..%.3f]",
+                modeName, seq, eye, zoom, camState, g_eyeTex[0], leftCropped ? 1 : 0,
+                leftBounds.uMin, leftBounds.uMax, leftBounds.vMin, leftBounds.vMax,
+                g_eyeTex[1], rightCropped ? 1 : 0, rightBounds.uMin, rightBounds.uMax,
+                rightBounds.vMin, rightBounds.vMax);
+            const bool leftSaved = SaveTextureBmp(g_eyeTex[0], leftPath);
+            const bool rightSaved = SaveTextureBmp(g_eyeTex[1], rightPath);
+            Log("vr: capture pair result left=%d path=%s right=%d path=%s",
+                leftSaved ? 1 : 0, leftPath.c_str(), rightSaved ? 1 : 0, rightPath.c_str());
+        }
+        }
+    }
 
     if (g_vrWaitPoses) {
         vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount] = {};
         g_vrComp->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+        // [vr] recenter_key (VK code): press -> the current head direction becomes the
+        // new zero pose. Cancels the seated zero pose's residual yaw AND pitch (SteamVR's
+        // ResetZeroPose resets position and yaw but never pitch), then re-places the
+        // 2D screen onto the new forward direction.
+        static bool s_rcDown = false;
+        // Keyboard (default Delete; "pressed since last call" bit also catches short taps) OR the
+        // gamepad combo L3+R3 (both stick clicks), since the keyboard may be out of reach in VR.
+        bool keyDown = false;
+        if (g_recenterKey) {
+            const SHORT ks = GetAsyncKeyState(g_recenterKey);
+            keyDown = (ks & 0x8000) != 0 || (ks & 0x0001) != 0;
+        }
+        const bool padDown = PadRecenterCombo();
+        const bool rcDown = keyDown || padDown;
+        if (rcDown && !s_rcDown) {
+            Log("vr: recenter requested (%s)", padDown ? "gamepad L3+R3" : "keyboard");
+        }
+        if (rcDown && !s_rcDown) {
+            const vr::TrackedDevicePose_t& hp = poses[vr::k_unTrackedDeviceIndex_Hmd];
+            if (hp.bPoseIsValid) {
+                float yaw = 0.0f, pitch = 0.0f;
+                PoseYawPitch(hp.mDeviceToAbsoluteTracking, yaw, pitch);
+                g_yawOff = -yaw;
+                g_pitchOff = -pitch;
+                Log("vr: recenter: head yaw=%.2f deg pitch=%.2f deg -> offsets set, 2D screen re-placed",
+                    yaw * 57.2957795f, pitch * 57.2957795f);
+                VrPlaceOverlay(g_overlayIsPip);
+            }
+        }
+        s_rcDown = rcDown;
         VrWritePose(poses[vr::k_unTrackedDeviceIndex_Hmd]);
+        g_lastHmdPose = poses[vr::k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking;
+        g_lastHmdPoseOk = poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid;
     }
 
-    if (flat && g_vrOverlay && g_overlay != vr::k_ulOverlayHandleInvalid && g_flatTex) {
+    // ADS as a head-locked overlay ([vr] ads_overlay=1): while aiming the view ignores head rotation
+    // (plugin aim_headrot=0), i.e. the content is head-locked. Submitted as an eye texture the
+    // compositor reprojects it as if it were world-locked, which shows up as a double image when the
+    // head moves. An HMD-relative overlay is composited head-locked without any reprojection.
+    const bool adsOv = g_adsMode == 1 && !flat && g_monoAim && g_vrOverlay
+                       && g_overlay != vr::k_ulOverlayHandleInvalid && g_eyeTex[eye];
+    // Conversation panel ([vr] dialogue_panel=1): the dialogue options and subtitles are drawn by the
+    // game in the lower centre of the frame, which falls on/below the lower edge of the headset's
+    // vertical FOV (asymmetric: ~55 deg up, ~44 deg down) and is tiny. Show a magnified crop of that
+    // region as a head-relative panel in front of the lower view while the 3D scene keeps rendering.
+    const bool dlgPanel = g_vrDlgPanel && !flat && !adsOv && camState == 12 && g_vrOverlay
+                          && g_overlay != vr::k_ulOverlayHandleInvalid && g_eyeTex[eye]
+                          && (!g_dlgGate || g_vrDlgFull || VrDialogueOptionsVisible(g_eyeTex[eye]));
+    if (!dlgPanel && g_overlayIsDlg && g_vrOverlay && g_overlay != vr::k_ulOverlayHandleInvalid) {
+        VrResetOverlayBounds();
+    }
+    if (dlgPanel) {
+        const bool haveDlg = VrDialoguePanelUpdate(g_eyeTex[eye]) && g_dlgTex;
+        vr::Texture_t ptex = { haveDlg ? g_dlgTex : g_eyeTex[eye], vr::TextureType_DirectX, vr::ColorSpace_Auto };
+        g_vrOverlay->SetOverlayTexture(g_overlay, &ptex);
+        if (!g_overlayIsDlg || !g_overlayShown) {
+            g_overlayIsDlg = true;
+            g_overlayIsAds = false;
+            VrPlaceDialoguePanel();
+            if (!g_overlayShown) { g_vrOverlay->ShowOverlay(g_overlay); g_overlayShown = true; }
+            Log("vr: dialogue panel shown (crop u %.2f..%.2f v %.2f..%.2f, %.2f m wide at %.2f m)", g_dlgCrop[0],
+                g_dlgCrop[2], g_dlgCrop[1], g_dlgCrop[3], g_vrDlgWidth, g_vrDlgDist);
+        }
+    } else if (adsOv) {
+        vr::Texture_t atex = { g_eyeTex[eye], vr::TextureType_DirectX, vr::ColorSpace_Auto };
+        g_vrOverlay->SetOverlayTexture(g_overlay, &atex);
+        if (!g_overlayIsAds || !g_overlayShown) {
+            g_overlayIsAds = true;
+            VrPlaceAdsOverlay();
+            if (!g_overlayShown) { g_vrOverlay->ShowOverlay(g_overlay); g_overlayShown = true; }
+            Log("vr: ADS shown as head-locked overlay (dist %.1f m, game tan x=%.3f)", g_vrAdsOverlayDist, g_gameTanX);
+        } else {
+            VrPlaceAdsOverlay();  // width follows the (animating) ADS FOV
+        }
+    } else if (flat && g_vrOverlay && g_overlay != vr::k_ulOverlayHandleInvalid && g_flatTex) {
+        if (g_overlayIsAds) {  // coming back from the ADS overlay: restore the seated 2D screen placement
+            g_overlayIsAds = false;
+            VrPlaceOverlay(g_overlayIsPip);
+        }
         // Pip-Boy: show the game's Pip-Boy UI target (projected Pip-Boy) instead of the zoomed frame.
         ID3D11Texture2D* pip = pipOpen ? VrPipboyTexture() : nullptr;
         ID3D11Texture2D* shown = pip ? pip : g_flatTex;
@@ -1840,14 +3144,42 @@ static void VrOnPresent(IDXGISwapChain* sc) {
     } else if (!flat && g_overlayShown) {
         g_vrOverlay->HideOverlay(g_overlay);
         g_overlayShown = false;
+        g_overlayIsAds = false;
+    }
+
+    // Own reticle: first-person 3D and ADS overlay (not the conversation panel).
+    const bool wantReticle = g_vrReticle && !flat && camState == 0 && !dlgPanel && g_vrOverlay;
+    if (wantReticle) {
+        VrReticleInit();
+        if (g_reticleOverlay != vr::k_ulOverlayHandleInvalid && !g_reticleShown) {
+            g_vrOverlay->ShowOverlay(g_reticleOverlay);
+            g_reticleShown = true;
+        }
+    } else if (g_reticleShown && g_reticleOverlay != vr::k_ulOverlayHandleInvalid) {
+        g_vrOverlay->HideOverlay(g_reticleOverlay);
+        g_reticleShown = false;
+    }
+
+    // HUD panels: first person 3D only (not conversation, not flat screens).
+    VrTuningFrame();
+    VrTuneOverlayFrame();
+    VrHudPanelsFrame(g_hudPanelsOn && !flat && (camState == 0 || camState == 7) && !dlgPanel && !adsOv);
+
+    ID3D11Texture2D* monoAimCaptureTexture = g_monoAim ? g_eyeTex[eye] : nullptr;
+    static bool s_monoAimPrev = false;
+    const bool monoAimChanged = g_monoAim != s_monoAimPrev;
+    if (monoAimChanged) {
+        Log("vr: mono aim capture texture=%p (capture eye=%ld)", monoAimCaptureTexture, eye);
+        s_monoAimPrev = g_monoAim;
     }
 
     for (int i = 0; i < 2; ++i) {
-        ID3D11Texture2D* src = flat ? g_blackTex : g_eyeTex[i];
+        const bool dlgFullScreen = dlgPanel && g_vrDlgFull;  // full-frame head-locked screen (2D); else only a panel
+        ID3D11Texture2D* src = (flat || adsOv || dlgFullScreen) ? g_blackTex : g_eyeTex[i];
         if (!src) continue;
         vr::Texture_t tex = { src, vr::TextureType_DirectX, vr::ColorSpace_Auto };
         vr::VRTextureBounds_t bounds = { 0.0f, 0.0f, 1.0f, 1.0f };
-        const bool useBounds = !flat && g_vrUseBounds && VrEyeBounds(i, bounds);
+        const bool useBounds = !flat && !adsOv && !dlgFullScreen && g_vrUseBounds && VrEyeBounds(i, bounds);
         // Log on change (not just the first two): bounds moving per eye tells
         // whether the crop keeps a horizontal offset between the eyes (mono aim
         // must collapse them to the same window for a real single image).
@@ -1858,8 +3190,26 @@ static void VrOnPresent(IDXGISwapChain* sc) {
             Log("vr: eye %d bounds u=%.3f..%.3f v=%.3f..%.3f (game tan x=%.3f y=%.3f)", i, bounds.uMin, bounds.uMax,
                 bounds.vMin, bounds.vMax, g_gameTanX, g_gameTanY);
         }
-        vr::EVRCompositorError e = g_vrComp->Submit(i == 0 ? vr::Eye_Left : vr::Eye_Right, &tex,
-                                                    useBounds ? &bounds : nullptr);
+        // Hipfire stereo: tell the compositor the pose each eye was rendered with, so its
+        // reprojection corrects the eye that lags a tick. Not used for mono aim (the view is
+        // head-locked there) or the 2D/black frames.
+        const bool withPose = g_vrSubmitPose && !flat && !g_monoAim && g_eyePoseOk[i];
+        vr::VRTextureWithPose_t texPose = {};
+        if (withPose) {
+            texPose.handle = tex.handle;
+            texPose.eType = tex.eType;
+            texPose.eColorSpace = tex.eColorSpace;
+            texPose.mDeviceToAbsoluteTracking = g_eyePose[i];
+        }
+        vr::EVRCompositorError e = g_vrComp->Submit(i == 0 ? vr::Eye_Left : vr::Eye_Right,
+                                                    withPose ? static_cast<const vr::Texture_t*>(&texPose) : &tex,
+                                                    useBounds ? &bounds : nullptr,
+                                                    withPose ? vr::Submit_TextureWithPose : vr::Submit_Default);
+        if (monoAimChanged) {
+            Log("vr: submit eye=%d texture=%p mono=%d bounds=%d u=%.3f..%.3f v=%.3f..%.3f zoom=%ld camState=%ld seq=%ld err=%d",
+                i, src, g_monoAim ? 1 : 0, useBounds ? 1 : 0, bounds.uMin, bounds.uMax, bounds.vMin, bounds.vMax,
+                g_shm ? g_shm->zoom : -1, g_shm ? g_shm->camState : -1, seq, static_cast<int>(e));
+        }
         if (e != vr::VRCompositorError_None) {
             g_vrLastErr = (int)e;
             if (g_vrSubmitErr++ < 10) Log("vr: submit eye %d error %d", i, (int)e);
@@ -1872,9 +3222,24 @@ static void VrOnPresent(IDXGISwapChain* sc) {
         Log("vr: frame %u eye=%ld seq=%ld flat=%d submitOk=%u submitErr=%u lastErr=%d", g_vrSubmits, eye,
             seq, flat ? 1 : 0, g_vrSubmitOk, g_vrSubmitErr, g_vrLastErr);
     }
+    HandleRenderDocCapture(flat, camState);
 }
 
 static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* self, UINT sync, UINT flags) {
+    // One-time timing + stereo-config init, on the first present of ANY path.
+    // This used to live at the tail of SaveTextureBmp and became unreachable
+    // dead code after an edit, which left g_qpf==0 (t=inf), g_frameShift=NaN
+    // and g_stereoEnabled=true-by-default -> the camera buffer patch wrote NaN
+    // view-projections and the world vanished (only character+weapon visible).
+    static bool s_stereoInited = false;
+    if (!s_stereoInited) {
+        s_stereoInited = true;
+        QueryPerformanceFrequency(&g_qpf);
+        QueryPerformanceCounter(&g_qpcStart);
+        LoadStereoConfig();
+        Log("stereo experiment: enabled=%d amp_units=%.3f period_sec=%.2f",
+            g_stereoEnabled ? 1 : 0, g_ampUnits, g_periodSec);
+    }
     LONG n = InterlockedIncrement(&g_frames);
     {
         LARGE_INTEGER now;
@@ -2227,12 +3592,30 @@ static IDXGIAdapter* GetDxgi11Adapter(IDXGIAdapter* in, D3D_DRIVER_TYPE& driverT
     return found;
 }
 
+// Re-entrancy guard. When RenderDoc and the Steam overlay both hook D3D11 creation while our
+// proxy is itself named d3d11.dll, their "original function" can point back at this proxy and
+// recurse until the stack overflows (crash dumps 15.11.2026). A nested call on the same thread
+// can never be satisfied, so fail it cleanly instead of recursing.
+static thread_local int t_createDepth = 0;
+struct CreateGuard {
+    bool nested;
+    CreateGuard() : nested(t_createDepth > 0) { ++t_createDepth; }
+    ~CreateGuard() { --t_createDepth; }
+};
+static void LogNestedCreate(const char* what) {
+    static LONG s_count = 0;
+    if (InterlockedIncrement(&s_count) <= 3)
+        Log("%s: nested call from another hook (RenderDoc/overlay loop?) refused to avoid stack overflow", what);
+}
+
 extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
     IDXGIAdapter* adapter, D3D_DRIVER_TYPE driverType, HMODULE software, UINT flags,
     const D3D_FEATURE_LEVEL* levels, UINT numLevels, UINT sdkVersion,
     const DXGI_SWAP_CHAIN_DESC* scDesc, IDXGISwapChain** outSwapChain,
     ID3D11Device** outDevice, D3D_FEATURE_LEVEL* outLevel, ID3D11DeviceContext** outContext)
 {
+    CreateGuard guard;
+    if (guard.nested) { LogNestedCreate("D3D11CreateDeviceAndSwapChain"); return E_FAIL; }
     OpenLogs();
     if (!LoadReal()) { Log("Failed to load real d3d11.dll"); return E_FAIL; }
     auto fn = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(
@@ -2264,6 +3647,8 @@ extern "C" HRESULT WINAPI D3D11CreateDevice(
     const D3D_FEATURE_LEVEL* levels, UINT numLevels, UINT sdkVersion,
     ID3D11Device** outDevice, D3D_FEATURE_LEVEL* outLevel, ID3D11DeviceContext** outContext)
 {
+    CreateGuard guard;
+    if (guard.nested) { LogNestedCreate("D3D11CreateDevice"); return E_FAIL; }
     OpenLogs();
     if (!LoadReal()) return E_FAIL;
     auto fn = reinterpret_cast<decltype(&D3D11CreateDevice)>(

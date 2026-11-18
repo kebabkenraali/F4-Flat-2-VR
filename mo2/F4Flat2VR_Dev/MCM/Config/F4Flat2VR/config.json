@@ -1,0 +1,194 @@
+{
+  "modName": "F4Flat2VR",
+  "displayName": "F4 Flat 2 VR",
+  "minMcmVersion": 2,
+  "pluginRequirements": [],
+  "pages": [
+    {
+      "pageDisplayName": "HUD-alue",
+      "content": [
+        {
+          "type": "text",
+          "text": "Alue, jonka sisälle HUD-elementtien täytyy mahtua kypärässä. Pelaaja voi käyttää mitä HUD-modia tahansa."
+        },
+        {
+          "type": "slider",
+          "text": "Vasen reuna (°)",
+          "id": "hud_frame_left_deg:VR",
+          "help": "Kulma keskisuunnasta vasemmalle (negatiivinen).",
+          "valueOptions": {
+            "min": -90.0,
+            "max": 0.0,
+            "step": 1.0,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "type": "slider",
+          "text": "Oikea reuna (°)",
+          "id": "hud_frame_right_deg:VR",
+          "help": "Kulma keskisuunnasta oikealle.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 90.0,
+            "step": 1.0,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "type": "slider",
+          "text": "Yläreuna (°)",
+          "id": "hud_frame_top_deg:VR",
+          "help": "Kulma ylöspäin.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 60.0,
+            "step": 1.0,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "type": "slider",
+          "text": "Alareuna (°)",
+          "id": "hud_frame_bottom_deg:VR",
+          "help": "Kulma alaspäin (negatiivinen).",
+          "valueOptions": {
+            "min": -60.0,
+            "max": 0.0,
+            "step": 1.0,
+            "sourceType": "ModSettingFloat"
+          }
+        }
+      ]
+    },
+    {
+      "pageDisplayName": "Keskustelu",
+      "content": [
+        {
+          "text": "Keskustelu: valintapaneeli ja kamera.",
+          "type": "text"
+        },
+        {
+          "text": "Valintapaneeli päällä",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          },
+          "id": "dialogue_panel:VR",
+          "type": "switcher",
+          "help": "Näytä valinnat suurennettuna paneelina."
+        },
+        {
+          "text": "Kamera lukittu keskustelussa",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          },
+          "id": "dialogue_freeze:engine",
+          "type": "switcher",
+          "help": "Pää ei kierrä kameraa keskustelussa."
+        },
+        {
+          "text": "Paneelin etäisyys (m)",
+          "valueOptions": {
+            "min": 0.5,
+            "step": 0.05,
+            "max": 3.0,
+            "sourceType": "ModSettingFloat"
+          },
+          "id": "dialogue_panel_dist_m:VR",
+          "type": "slider",
+          "help": "Etäisyys silmistä."
+        },
+        {
+          "text": "Paneelin leveys (m)",
+          "valueOptions": {
+            "min": 0.5,
+            "step": 0.05,
+            "max": 3.0,
+            "sourceType": "ModSettingFloat"
+          },
+          "id": "dialogue_panel_width_m:VR",
+          "type": "slider",
+          "help": "Suurempi = isompi teksti."
+        },
+        {
+          "text": "Paneelin korkeus (m)",
+          "valueOptions": {
+            "min": -1.0,
+            "step": 0.01,
+            "max": 1.0,
+            "sourceType": "ModSettingFloat"
+          },
+          "id": "dialogue_panel_y_m:VR",
+          "type": "slider",
+          "help": "Negatiivinen = alas."
+        },
+        {
+          "text": "Kameran taaksesiirto (m)",
+          "valueOptions": {
+            "min": 0.0,
+            "step": 0.05,
+            "max": 1.5,
+            "sourceType": "ModSettingFloat"
+          },
+          "id": "dialogue_back_m:engine",
+          "type": "slider",
+          "help": "Kamera taaksepäin keskustelussa."
+        },
+        {
+          "text": "Keskustelun kuvakulma",
+          "valueOptions": {
+            "min": 0.0,
+            "step": 1.0,
+            "max": 137.0,
+            "sourceType": "ModSettingFloat"
+          },
+          "id": "dialogue_fov:engine",
+          "type": "slider",
+          "help": "0 = sama kuin hipfiressä."
+        }
+      ]
+    },
+    {
+      "pageDisplayName": "Yleiset",
+      "content": [
+        {
+          "text": "Yleiset: tähtäyksen ristikko ja HUD-paneelit.",
+          "type": "text"
+        },
+        {
+          "text": "Oma ristikko",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          },
+          "id": "reticle:VR",
+          "type": "switcher",
+          "help": "Proxyn oma ristikko (pelin oma ristikko pois asetuksella bCrosshairEnabled=0)."
+        },
+        {
+          "text": "Ristikon koko (aste)",
+          "valueOptions": {
+            "min": 0.5,
+            "step": 0.1,
+            "max": 6.0,
+            "sourceType": "ModSettingFloat"
+          },
+          "id": "reticle_deg:VR",
+          "type": "slider",
+          "help": "Kokonaiskoko asteina."
+        },
+        {
+          "text": "Ristikon etäisyys (m)",
+          "valueOptions": {
+            "min": 0.5,
+            "step": 0.1,
+            "max": 6.0,
+            "sourceType": "ModSettingFloat"
+          },
+          "id": "reticle_dist_m:VR",
+          "type": "slider",
+          "help": "Etäisyys silmistä."
+        }
+      ]
+    }
+  ]
+}
